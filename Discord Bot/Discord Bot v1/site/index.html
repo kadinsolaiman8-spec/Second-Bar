@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TradingBot Local Monitor</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="side">
+        <div class="brand">
+          <div class="brand-mark">TB</div>
+          <div>
+            <h1>TradingBot</h1>
+            <p>Local monitor</p>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <button class="nav-button active" type="button" data-section="status">Status</button>
+          <button class="nav-button" type="button" data-section="alerts">Alerts</button>
+        </nav>
+
+        <div class="side-note">
+          <span class="dot"></span>
+          <span>Dashboard server online</span>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="top">
+          <div>
+            <p class="eyebrow">TradingBot V3.0</p>
+            <h2>Live status and trade alert outputs.</h2>
+          </div>
+          <div class="market-pill" id="topMarketPill">Checking market...</div>
+        </header>
+
+        <section class="page active" id="status">
+          <article class="market-panel" id="marketPanel">
+            <div>
+              <p class="eyebrow">Market clock</p>
+              <h3 id="marketTitle">Checking market...</h3>
+              <p id="marketMessage">Reading Eastern Time market hours.</p>
+            </div>
+            <div class="market-time">
+              <span id="etTime">--:-- ET</span>
+              <small id="nextEvent">Next event loading</small>
+            </div>
+          </article>
+
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">Health</p>
+              <h3>Is Everything Working?</h3>
+            </div>
+            <button class="button" id="refreshStatus" type="button">Refresh Status</button>
+          </div>
+
+          <div class="health-grid" id="healthGrid"></div>
+
+          <div class="section-title small">
+            <div>
+              <p class="eyebrow">Schedule</p>
+              <h3>Important Market Windows</h3>
+            </div>
+          </div>
+          <div class="schedule-grid" id="scheduleGrid"></div>
+        </section>
+
+        <section class="page" id="alerts">
+          <div class="section-title">
+            <div>
+              <p class="eyebrow">Alert outputs</p>
+              <h3>Trade Alerts Feed</h3>
+            </div>
+            <div class="toolbar">
+              <button class="button" id="addDemoAlert" type="button">Add Demo Alert</button>
+              <button class="button secondary" id="clearDemoAlerts" type="button">Reset Feed</button>
+            </div>
+          </div>
+
+          <div class="alert-filters" id="alertFilters"></div>
+          <div class="alerts-notice" id="alertsNotice"></div>
+
+          <div class="alerts-layout">
+            <div class="alerts-feed" id="alertsFeed"></div>
+            <aside class="alert-detail" id="alertDetail"></aside>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
