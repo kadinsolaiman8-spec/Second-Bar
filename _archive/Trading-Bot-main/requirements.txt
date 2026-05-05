@@ -1,0 +1,11 @@
+py-cord>=2.6
+yfinance>=0.2.40
+mplfinance>=0.12.0b0
+vaderSentiment>=3.3.2
+ta>=0.11.0
+pyyaml>=6.0
+python-dotenv>=1.0
+supabase>=2.0.0
+scipy>=1.11.0
+arch>=7.0
+pytest>=8.0

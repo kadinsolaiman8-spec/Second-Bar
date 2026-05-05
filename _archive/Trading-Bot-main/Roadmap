@@ -1,0 +1,205 @@
+Current status (2026-03-23): **MR on large-cap indices (SPY/QQQ/IWM) is abandoned** — SPY round 2 with reduced 4-combo grid: IS gate FAIL (p=0.178), OOS bootstrap FAIL (p=0.529), avg OOS -0.1%. Strategy has no detectable edge even with pure MR weights and lower DSR noise ceiling. **Next:** TF validation on SPY/QQQ/IWM (underpowered in round 1), product decision on signal mode for these tickers. VIX tz-mismatch bug fixed in `src/data.py` — regime diagnostics will work on next WFO run.
+
+**P1 study-design tooling (2026-03-19):** In-repo support for verified-roadmap P1 is **done**: `docs/wfo_batches/` (README, `BEGINNER_EXACT_STEPS.md`, example prereg aligned to `run_wfo_batch.ps1`, sample CSV), **`src/stats_utils.py`** (Benjamini–Hochberg + Bonferroni), **`scripts/apply_multiple_testing_correction.py`**, **`tests/test_multiple_testing.py`**. **Operational:** each real batch still requires *you* to run WFO, copy primary p-values into a CSV, run the script, append outputs + hold-out (**DIA** per beginner doc) to the prereg file — the bot does not auto-fill that.
+
+Validation log: MR round 1 (48 combos): SPY -1.5%, QQQ -1.2%, IWM -3.5% avg OOS — all FAIL. MR round 2 (4 combos, pure MR): SPY -0.1% avg OOS, IS gate p=0.178, bootstrap p=0.529 — FAIL. TF round 1: GLD +1.6% (p=0.188, underpowered), XLE -1.1% (p=0.274, underpowered). GDX removed. **0/5 tickers validated; MR abandoned on large-caps.**
+
+**P2 statistical reporting (2026-03+):** **Done** in codebase — WFO CLI prints OOS trade totals/averages/by-fold, heuristic low-power notes (`oos_trade_power_notes_from_results` in `src/walk_forward.py`, thresholds in `config.yaml`), `tf_train_bars` / `1W.tf_train_bars`, and `WFO windows:` line in `src/run_wfo.py`. See `docs/CLAUDE_SONNET_REVIEW_VERIFIED_ROADMAP.md` §P2.
+
+**P3 observability (~2026-03+):** **Done** — `run_wfo --print-resolved-config`; VIX empty/fail WARNING in `src/data.py`; WFO regime line; [`docs/LIVE_BACKTEST_STOP_PARITY.md`](docs/LIVE_BACKTEST_STOP_PARITY.md); hybrid-vs-official MR startup warning (`src/validation_routing.py`). **P4 slice:** tests for `config_resolver`, `indicator_scores` smoke, synthetic WFO folds (`tests/`).
+
+**Next (validation track):** (1) Run WFO on any ticker to verify VIX regime diagnostics now work (fixed tz bug). (2) TF validation on SPY/QQQ/IWM — these need TF-mode WFO with adequate power. (3) Product decision: switch SPY/QQQ/IWM to `strategy: tf` with experimental disclaimer, or keep hybrid marked experimental. (4) GLD/XLE TF re-validation with more power. **Tests:** `python -m pytest tests/ -v`.
+
+# Discord Trading Bot — Product Roadmap
+
+End-goal oriented roadmap. Phases are sequenced by dependency; features are orchestrated across phases where they connect.
+
+---
+
+## Phase 1 — Strategy & Logic
+
+**Goal:** Harden the multi-factor strategy, add new data sources, and define exit/position logic that backtest and live trading will share.
+
+- [x] Bar-level Sharpe optimization (252 data points per fold vs 2-5 per-trade)
+- [x] Walk-forward optimization (WFO) with plateau selection
+- [x] Deflated Sharpe Ratio (DSR)
+- [x] PBO (CSCV) — printed only when `walk_forward.show_pbo: true`; default **off** until IS matrix metric matches `compute_pbo` assumptions (`optimize_metric` vs Sharpe-like PBO)
+- [x] Primary OOS stationary bootstrap — concatenated `bar_returns`, Sharpe diagnostic; CLI banner vs WFO selection metric (`src/walk_forward.py`, `src/run_wfo.py`; `--no-oos-bootstrap`, `--oos-bootstrap-samples`, `--oos-bootstrap-seed`)
+- [x] Secondary bar-permutation labeling — MR/TF caveats, profit-factor statistic vs primary Sharpe (`docs/STRATEGY_AND_EDGE.md`)
+- [x] Pytest — bootstrap / concatenation smoke tests (`tests/test_walk_forward_bootstrap.py`)
+- [x] Param grid reduction (324 → 48 combos)
+- [x] TF param grid widening (null ADX, more Donchian periods)
+- [x] TF live routing (GLD/XLE/GDX use Donchian signals in /stock and /recap)
+- [x] Monte Carlo permutation test
+- [x] VIX-based regime system (replaces 200 SMA filter)
+- [x] Volume indicators (VWAP, OBV, CMF)
+- [x] Hybrid MR+TF signal system (SPY/QQQ/IWM)
+- [x] Expert Input integration (config-only indicator)
+- [x] Data source redundancy (Alpha Vantage, Polygon fallback)
+- [x] Hard stop in backtest (stop_pct config)
+- [x] Take-profit + trailing stops in backtest (ATR-based and percentage-based)
+- [x] Stop/TP levels in live `/stock` signals
+- [x] Weight optimization (WFO grid includes rsi_weight/trend_weight)
+- [x] Longer OOS window (test_bars: 126)
+- [x] P1 validation study design (verified roadmap) — pre-registration + multiplicity correction + hold-out **workflow** (`docs/wfo_batches/`, `src/stats_utils.py`, `scripts/apply_multiple_testing_correction.py`, `tests/test_multiple_testing.py`; see `BEGINNER_EXACT_STEPS.md`)
+- [ ] Insider Trades — insider transaction data as a weighted factor in the consensus
+- [ ] Financials — fundamental data (income, balance sheet, cash flow) as a weighted factor
+  - Graham intrinsic value formula (EPS × (8.5 + 2g) × 4.4/Y); DCF model as secondary
+  - EPS growth estimation: analyst consensus forward EPS or trailing 5yr CAGR
+  - Discount-from-intrinsic-value as a weighted indicator in MR consensus (like News/Expert)
+  - 90-day conservative reporting lag for fundamentals (see `docs/SURVIVORSHIP_BIAS_RESEARCH.md` §3)
+  - Data: yfinance `info` for basic fundamentals; Alpha Vantage earnings for PIT filing dates
+- [ ] Fear & Greed Sentiment — CNN Fear & Greed Index as a sentiment indicator (distinct from VIX regime)
+  - Per-ticker F&G sensitivity factor: correlation/anti-correlation coefficient (e.g. TSLA positive, defensive stocks negative)
+  - Weighted indicator in consensus like News/Expert; sensitivity factor scales the raw signal
+  - Data limitation: public CNN F&G data only back to ~2011; backtests constrained accordingly
+  - Implementation pattern: follow `src/expert.py` (config-driven, per-ticker sensitivity in `ticker_profiles`)
+- [ ] Auto Mode Picker — auto-select best strategy (MR/TF/hybrid) per ticker based on backtest or regime; currently manual via ticker_profiles
+- [ ] Position Sizing (Design) — define sizing rules (% of portfolio, max per position) so backtest and paper/live share assumptions
+- [ ] Discord Dev Portal — full configuration for command stability (permissions, scopes, rate limits)
+- [ ] Parameter Stability — cluster optimal params across folds (K-means); prefer stable params over lucky peaks. <!-- CHECK AGAIN: plateau selection covers some of this, but no actual clustering implemented -->
+
+---
+
+## Phase 2 — Interface & Market Expansion
+
+**Goal:** Broader asset coverage, richer UX, explainability, and alerts. Depends on Phase 1 for strategy stability.
+
+- [x] Recap Queue — asyncio queue for sequential recap processing
+- [x] `/Supported` command — lists markets, indexes, total stock count
+- [x] Visual Charts (mplfinance) — candlestick + indicators for `/stockchart`, `/indicatorbacktest`, `/daytrade`
+- [x] "Why This Signal?" Breakdown (basic) — optional `show_breakdown` flag shows per-indicator name + side
+- [x] International Indexes (partial) — DAX, FTSE 100, CAC 40
+- [ ] Expanded Assets — Chinese markets, emerging markets, specialized ETFs, commodities TF validation
+- [ ] Interactive Charts — Plotly or richer charting (current: static mplfinance only)
+- [ ] `/stock Index` — context-aware stock command using profile strategy for index constituents
+- [ ] Strategy Comparison — command to compare MR vs TF vs hybrid side-by-side for a ticker
+- [ ] Prediction Markets — Kalshi/Polymarket tracking ("wisdom of the crowd" sentiment)
+- [ ] Custom Alerts — user-defined alerts (e.g. "notify when AAPL hits Buy" or "RSI < 30")
+- [ ] "Why This Signal?" Breakdown (full) — show weights, thresholds, and reasoning, not just indicator name + side <!-- CHECK AGAIN: basic version exists, full version with weights/reasoning not yet -->
+- [ ] Historical Data Quality — survivorship bias, point-in-time index membership, split/dividend handling
+  - Full research: `docs/SURVIVORSHIP_BIAS_RESEARCH.md` (PIT data, reporting lag, data sources, implementation approach)
+  - Index reconstruction: S&P membership change logs (GitHub CSVs for 1996+; Siblis/Norgate for production)
+  - Equal-weighted baseline from same PIT universe for fair strategy comparison (avoids survivor-biased benchmark)
+  - Delisted ticker handling: include bankruptcies/acquisitions in price data; ticker mapping for renames
+
+---
+
+## Phase 3 — VectorBT Migration
+
+**Goal:** Replace backtest engine with VectorBT for speed. Required before LLM layer can analyze rich per-trade data.
+
+- [ ] Performance — WFO runs in ~10 seconds
+- [ ] Foundation — per-trade and per-bar data for LLM analysis layer and signal outcome tracking
+
+---
+
+## Phase 4 — LLM Research & Analysis Layer
+
+**Goal:** Structural strategy advice from backtest output and live signal feedback. Depends on VectorBT for fast, rich data.
+
+- [ ] Deep Analysis — analyze stability, regime interaction, and trade distribution across folds
+- [ ] Hypothesis Generation — LLM proposes structural changes (e.g. "reduce RSI weight in high-vol regimes")
+- [ ] Perplexity Integration — real-time macro research to validate LLM hypotheses
+- [ ] `/Deep [Command]` — AI Bull/Bear researchers debate using indicators, news, expert input, AI research; Risk Manager evaluates; outputs structured analysis
+- [ ] Signal Outcome Tracking — track whether past signals hit target, stopped out, or reversed; feeds back into strategy
+- [ ] ML/LSTM Prediction Layer — machine learning signal as a weighted input alongside LLM analysis
+  - Classification-based signals preferred (will return exceed threshold?) vs raw price regression
+  - Uncertainty modeling: Monte Carlo dropout for confidence calibration; reject low-confidence predictions
+  - Multi-horizon forecasting: 1d, 1w, 1m, 6m normalized returns as separate signal channels
+  - Walk-forward training splits with purging gaps (anti-leakage between train/val/test)
+  - Feature engineering: technical indicators + regime state + sentiment as input features
+  - Iterative approach: start with simple LSTM baseline, add features incrementally
+
+---
+
+## Phase 5 — Paper Trading & Social Profiles
+
+**Goal:** Validate execution vs backtest and enable user-specific strategies. Requires Phase 1 position sizing and Phase 2 alerts.
+
+- [ ] User Profiles (`/profile`) — personal indicator weights and preferred strategies
+- [ ] Position Sizing (Implementation) — apply sizing rules in paper trading
+- [ ] Portfolio-Level Risk View — exposure, correlation, diversification
+- [ ] Paper Trading — Alpaca paper trading to validate live execution
+- [ ] Broker Integration Security — OAuth, secure token storage, read-only vs trading scopes
+- [ ] Social Features — share performance and strategy configs
+- [ ] Leaderboards — opt-in server-scoped performance rankings
+- [ ] Strategy Marketplace — "clone strategy" flow
+
+---
+
+## Phase 6 — Scale & Monetization
+
+**Goal:** Sustainable cloud hosting, trust, and tiered service. Required before real money and Pro features.
+
+- [ ] Terms of Service & Disclaimers
+- [ ] Data Privacy — GDPR/CCPA alignment
+- [ ] Regulatory Scope — clarify informational-only scope
+- [ ] 2FA for Pro — identity verification for real trading
+- [ ] Usage-Based Limits — rate limits on `/Deep` per tier
+- [ ] `/Deep Market Analysis` — long-horizon macro view via LLM
+- [ ] Tiered Service Model (Free / Pro / Enterprise)
+- [ ] Enterprise Tier — team dashboards, API access
+
+| Tier | Price | Features |
+|------|-------|----------|
+| Free | $0 | Standard signals, basic `/stock` commands, cloud-hosted bot |
+| Pro | $20/yr or $4/mo | Personal `/profile` strategy, Expert Input access, social features, `/Deep` access |
+| Enterprise | TBD | Team profiles, shared dashboards, API access |
+
+---
+
+## Phase 7 — Far Future
+
+**Goal:** Web platform and out-of-Discord reach. Depends on Phase 6 monetization and trust.
+
+- [ ] Real Trading Website — web app for live trading, portfolio management, full bot functionality
+- [ ] Out-of-Discord Notifications — email or push for critical signals and alerts
+
+---
+
+## Validation Practices
+
+| Practice | Integration |
+|----------|-------------|
+| Pre-registration | `docs/wfo_batches/` — `README.md`, `BEGINNER_EXACT_STEPS.md`, per-batch `*-prereg.md` (e.g. `2026-03-19-initial-prereg.md`) aligned to `run_wfo_batch.ps1` |
+| Bar-level returns for Sharpe | `position × shifted_returns` in WFO; per-trade for reporting; DSR + **primary** OOS bootstrap use stitched OOS bar-P&L |
+| Primary vs secondary tests | **Primary:** stationary bootstrap on concatenated OOS bar-P&L (default post-WFO). **Secondary:** bar permutation (full history, profit factor); `--permutation-test`. See `docs/STRATEGY_AND_EDGE.md` |
+| Monte Carlo / permutation | OOS bar perm: `--permutation-test` + `--permutation-samples`; bootstrap draws: `--oos-bootstrap-samples` |
+| Multiplicity across tickers | P1: BH (`src/stats_utils.py`) + CLI `scripts/apply_multiple_testing_correction.py` on CSV of **official-mode** p-values; document FDR q / Bonferroni α in batch appendix (see verified roadmap) |
+| Survivorship bias | Point-in-time index membership; historical constituents (Phase 2) |
+| Parameter stability | Plateau selection implemented; K-means clustering not yet (Phase 1) |
+| Regression tests | `python -m pytest tests/ -v` |
+| WFO batch wall time | `run_wfo_batch.ps1` default (1000 gate + 500 perm sims/ticker, full history): often **many hours to multi-day per ticker** (MR heavier in WFO); full batch usually **multi-day**. See `docs/wfo_batches/BEGINNER_EXACT_STEPS.md` **Runtime**. |
+
+**External review (verified):** `docs/CLAUDE_SONNET_REVIEW_VERIFIED_ROADMAP.md` — Sonnet critique vs codebase, **locked decisions** (primary = stationary bootstrap on concatenated OOS; bar perm = secondary; hybrid policy; PBO suspended until metric-aligned), P0–P5 action items.
+
+---
+
+## Cross-Phase Orchestration
+
+| Theme | Phases | How It Connects |
+|-------|--------|-----------------|
+| **Position sizing** | 1 → 5 | Designed in Phase 1; implemented in Phase 5 (paper/live) |
+| **Explainability** | 2 → 4 | "Why this signal?" in Phase 2; Signal outcome tracking in Phase 4 closes the loop |
+| **Alerts** | 2 → 7 | Custom alerts in Phase 2 (Discord); out-of-Discord notifications in Phase 7 |
+| **Trust** | 2 → 6 | Per-signal breakdown builds trust; ToS, privacy, 2FA formalize before Pro |
+| **Data** | 1 → 3 | Redundancy in Phase 1; VectorBT in Phase 3 uses same data |
+| **LLM** | 3 → 4 → 6 | VectorBT feeds LLM; `/Deep` in Phase 4; usage limits in Phase 6 |
+
+---
+
+## Dependency Summary
+
+```
+Phase 1 (Strategy) ──┬──► Phase 2 (Interface & Markets)
+        │           │
+        │           └──► Phase 3 (VectorBT) ──► Phase 4 (LLM)
+        │                         │
+        └─────────────────────────┴──► Phase 5 (Paper & Profiles)
+                                                    │
+                                                    ▼
+                                            Phase 6 (Monetization)
+                                                    │
+                                                    └──► Phase 7 (Far Future)
+```

@@ -1,0 +1,324 @@
+guild_id: 1476735819522900031
+channel_id: 1476735820215091204
+recap_interval_minutes: 30
+recap_queue:
+  max_size: 3
+min_confidence: 60
+recap_timeframe: Daily
+show_signal_breakdown: false
+charts:
+  enabled: true
+  stock_indicators:
+  - supertrend
+  lookback_bars: 60
+  supertrend_period: 5
+  supertrend_multiplier: 2.0
+  lookback_by_timeframe:
+    1d: 13
+    1wk: 33
+    1h: 60
+  dpi: 120
+indicator_weights:
+  rsi: 1.5
+  bollinger: 1.0
+  trend: 1.5
+  stochastic: 1.0
+  williams_r: 1.0
+  ema: 1.2
+  volatility: 0.8
+  news: 1.0
+  expert: 1.0
+  vwap: 1.0
+  obv: 0.8
+  cmf: 0.6
+min_net_score: 0.5
+data_sources:
+  primary: yfinance
+  fallbacks: [alpha_vantage, polygon]
+  rate_limits:
+    alpha_vantage: 12   # min_interval_sec
+    polygon: 12
+expert_input:
+  enabled: true
+hybrid:
+  conflict_action: flat   # "flat" (Hold on conflict), "mr_priority", or "tf_priority"
+ticker_profiles:
+  SPY:
+    strategy: hybrid
+    min_net_score: 0.5
+    min_confidence: 40
+    indicator_weights:
+      rsi: 2.0
+      bollinger: 1.5
+      stochastic: 1.0
+      williams_r: 1.0
+      trend: 0
+      ema: 0
+      vwap: 0
+      obv: 0
+      cmf: 0
+    indicators:
+      rsi_oversold: 30
+      rsi_overbought: 70
+    trend_following:
+      donchian_period: 55
+      adx_threshold: null
+  QQQ:
+    strategy: hybrid
+    min_net_score: 0.5
+    min_confidence: 0
+    indicator_weights:
+      rsi: 2.0
+      trend: 2.0
+    indicators:
+      rsi_oversold: 30
+      rsi_overbought: 60
+    trend_following:
+      donchian_period: 55
+      adx_threshold: null
+  IWM:
+    strategy: hybrid
+    min_net_score: 0.5
+    min_confidence: 0
+    indicator_weights:
+      rsi: 2.0
+      trend: 2.0
+    indicators:
+      rsi_oversold: 35
+      rsi_overbought: 60
+    trend_following:
+      donchian_period: 55
+      adx_threshold: null
+  GLD:
+    trend_following:
+      donchian_period: 55
+      adx_threshold: null
+      gold_macro_filter: true
+    backtest:
+      trailing_stop_atr_multiplier: 2.0
+      max_hold_bars: 40
+    strategy: tf
+  XLE:
+    trend_following:
+      donchian_period: 55
+      adx_threshold: null
+    backtest:
+      trailing_stop_atr_multiplier: 2.0
+      max_hold_bars: 40
+    strategy: tf
+  # GDX removed: gold miners are mean-reverting equity instruments, not suitable for TF.
+  # Statistical validation showed p=0.512 (FAIL) and -4.2% avg OOS return vs B&H over 10y.
+asset_class_profiles:
+  sector_etf:
+    min_net_score: 0.55
+    indicator_weights:
+      trend: 1.7
+      rsi: 1.0
+      bollinger: 1.0
+  broad_etf:
+    min_net_score: 0.5
+    min_confidence: 65
+  us_large_cap:
+    min_net_score: 0.5
+    min_confidence: 60
+  us_tech:
+    min_net_score: 0.5
+    min_confidence: 60
+  european_index:
+    min_net_score: 0.52
+    min_confidence: 58
+  single_stock: {}
+regime:
+  method: vix_ensemble    # "vix_ensemble" (VIX + SMA-200) or "sma_200" (legacy)
+  vix_low: 18             # VIX below this → MR favored (low vol, range-bound)
+  vix_high: 25            # VIX above this → TF favored (high vol, trends persist)
+regime_filter: true
+regime_indicator_weights:
+  bull:
+    rsi: 1.6
+    stochastic: 1.1
+    williams_r: 1.1
+    trend: 1.3
+    ema: 1.0
+    bollinger: 1.0
+    volatility: 0.8
+    news: 1.0
+    vwap: 1.0
+    obv: 0.8
+    cmf: 0.6
+  bear:
+    rsi: 0.8
+    stochastic: 0.5
+    williams_r: 0.5
+    trend: 1.8
+    ema: 1.2
+    bollinger: 0.5
+    volatility: 0.8
+    news: 1.0
+    vwap: 1.2
+    obv: 1.0
+    cmf: 0.8
+  mixed:
+    rsi: 1.2
+    stochastic: 0.8
+    williams_r: 0.8
+    trend: 1.5
+    ema: 1.1
+    bollinger: 0.8
+    volatility: 0.8
+    news: 1.0
+    vwap: 1.0
+    obv: 0.8
+    cmf: 0.6
+timeframe_confidence_factors:
+  Daily: 1.0
+  1W: 0.95
+  1H: 0.85
+timeframe_indicator_weights:
+  Daily:
+    rsi: 1.6
+    stochastic: 1.1
+    williams_r: 1.1
+    trend: 1.3
+    ema: 1.0
+    bollinger: 1.0
+    volatility: 0.8
+    news: 1.0
+  1W:
+    rsi: 1.6
+    stochastic: 1.1
+    williams_r: 1.1
+    trend: 1.3
+    ema: 1.0
+    bollinger: 1.0
+    volatility: 0.8
+    news: 1.0
+  1H:
+    rsi: 1.2
+    stochastic: 0.8
+    williams_r: 0.8
+    trend: 1.7
+    ema: 1.4
+    bollinger: 1.0
+    volatility: 0.8
+    news: 1.0
+news:
+  enabled: true
+  max_headlines: 5
+  show_in_stock: true
+  weight: 1.0
+  sentiment_provider: vader
+  recap_top_volume: 15
+  market_news_ticker: SPY
+graham:
+  enabled: true
+  default_bond_yield: 0.045  # fallback if live ^TNX fetch fails
+data_period_days: 60
+indicators:
+  rsi_period: 14
+  rsi_oversold: 35
+  rsi_overbought: 65
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_period: 20
+  bb_std: 2
+  supertrend_period: 10
+  supertrend_multiplier: 3
+  stoch_window: 14
+  stoch_smooth: 3
+  stoch_oversold: 20
+  stoch_overbought: 80
+  willr_period: 14
+  willr_oversold: -80
+  willr_overbought: -20
+  ema_fast: 9
+  ema_slow: 21
+  atr_period: 14
+  atr_avg_period: 20
+  vwap_deviation_threshold: 1.5
+  cmf_threshold: 0.1
+  obv_sma_period: 20
+daytrade:
+  atr_stop_multiplier: 2.0
+  atr_tp_multiplier: 2.0
+trend_following:
+  donchian_period: 55
+  atr_period: 14
+  adx_period: 14
+  adx_threshold: null
+backtest:
+  commission_pct: 0.2
+  slippage_pct: 0.05
+  stop_pct: 5
+  take_profit_pct: 8
+  trailing_stop_pct: 0
+  trailing_stop_atr_multiplier: 0
+  max_hold_bars: 0
+  default_period: 1y
+  default_interval: 1d
+  min_confidence: 0
+walk_forward:
+  optimize_metric: profit_factor
+  # PBO: default off — compute_pbo assumes Sharpe-like CSCV; IS grid scores use optimize_metric.
+  show_pbo: false
+  train_bars: 252
+  test_bars: 126
+  step_bars: 126
+  embargo_bars: 5
+  # Daily TF only: minimum train length in bars (overrides per-timeframe also use tf_train_bars).
+  # Weekly/hourly: set tf_train_bars under timeframe_overrides for that timeframe.
+  tf_train_bars: 756
+  # Heuristic WFO warnings (P2): sparse OOS trades — see docs/CLAUDE_SONNET_REVIEW_VERIFIED_ROADMAP.md
+  low_power_oos_trades_total: 20
+  low_power_oos_trades_per_fold: 3
+  # Reduced from 48 to 4 combos. RSI thresholds fixed at 30/70 (symmetric, literature standard).
+  # trend_weight fixed at 0 (pure MR — trend indicators fight mean-reversion thesis).
+  # DSR noise ceiling: sqrt(2*ln(4)) = 1.66 (was 2.78 with 48 combos).
+  # Free dimensions: min_net_score (selectivity) and rsi_weight (RSI emphasis).
+  param_grid:
+    rsi_oversold:
+    - 30
+    rsi_overbought:
+    - 70
+    min_net_score:
+    - 0.4
+    - 0.5
+    rsi_weight:
+    - 1.5
+    - 2.0
+    trend_weight:
+    - 0
+  # Reduced from 4 to 2 combos. donchian_period fixed at 55 (literature-established,
+  # Turtle System 2). Optimizing lookbacks creates isolated peaks with no plateau — WFO chases noise.
+  # Expected noise Sharpe: sqrt(2*ln(2)) = 1.18 (was 1.66 with 4 combos).
+  trend_following_param_grid:
+    atr_multiplier:
+    - 2.0
+    - 3.0
+    adx_threshold:
+    - null
+    max_hold_bars:
+    - 0
+  timeframe_overrides:
+    1H:
+      train_bars: 336
+      test_bars: 168
+      step_bars: 168
+    1W:
+      train_bars: 52
+      test_bars: 13
+      step_bars: 13
+      tf_train_bars: 104
+      param_grid:
+        rsi_oversold:
+        - 30
+        - 35
+        rsi_overbought:
+        - 65
+        - 70
+        min_net_score:
+        - 0.5
+        - 0.6
+        min_confidence:
+        - 0

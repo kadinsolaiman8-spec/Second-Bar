@@ -1,0 +1,4 @@
+ticker,test_name,p_value
+SPY,oos_bootstrap,0.03
+QQQ,oos_bootstrap,0.04
+IWM,oos_bootstrap,0.10

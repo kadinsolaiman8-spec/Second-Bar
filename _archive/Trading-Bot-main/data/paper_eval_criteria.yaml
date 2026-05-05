@@ -1,0 +1,61 @@
+# Paper trading evaluation criteria
+# DO NOT modify pass/fail thresholds after paper trading begins
+#
+# Status: EXPLORATORY — not validated by historical backtest.
+# Historical 10y excess Sharpe test (2026-03-25) showed TF does not add
+# timing value over buy-and-hold on any testable universe (23 tickers,
+# mean excess Sharpe -0.177, t=-3.23). Paper trading is the only honest
+# remaining forward-looking test. The theory that TF works on non-equity
+# assets (Moskowitz et al., Hurst et al.) is legitimate but unconfirmed
+# by our data.
+#
+# Universe rationale: 12 non-equity/EM tickers selected by asset class
+# characteristics (no structural equity risk premium, or EM regime risk).
+# This is a post-hoc hypothesis suggested by the data, not a pre-committed
+# blind test. The real test is forward performance.
+
+committed_date: "2026-03-25"
+updated_date: "2026-03-25"
+
+# Minimum observation window before drawing conclusions
+evaluation_period_months: 6
+
+# Minimum trades across all tickers combined before evaluation is valid
+min_trades_to_evaluate: 15
+
+# ALL pass criteria must be met for overall PASS
+pass_criteria:
+  # Portfolio profit factor must exceed 1.0 (net profitable)
+  portfolio_profit_factor: 1.0
+  # Observed Sharpe must be >= 75th percentile of bootstrap null
+  observed_sharpe_vs_null_percentile: 75
+  # Maximum portfolio drawdown cannot exceed -25%
+  max_drawdown_pct: -25.0
+
+# ANY ONE fail criterion triggers early FAIL (before evaluation period ends)
+fail_criteria:
+  # PF < 0.8 = clear negative result, stop early
+  portfolio_profit_factor_below: 0.8
+  # No trades in 3 months = strategy not generating signals
+  zero_trades_after_months: 3
+
+# 12-ticker non-equity/EM universe
+# Commodities: GLD, SLV, DBA, DBC, USO
+# Bonds: TLT, IEF
+# Currencies: UUP, FXE
+# EM equity: EEM, FXI, EWZ
+tickers:
+  - GLD
+  - SLV
+  - DBA
+  - DBC
+  - USO
+  - TLT
+  - IEF
+  - UUP
+  - FXE
+  - EEM
+  - FXI
+  - EWZ
+
+strategy: tf

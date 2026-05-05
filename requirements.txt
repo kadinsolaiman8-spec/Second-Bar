@@ -1,0 +1,27 @@
+# Web backend
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.0
+
+# Scanner / scheduling (testkadin-derived)
+APScheduler>=3.10.0
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+pytz>=2023.3
+colorama>=0.4.6
+finnhub-python>=2.4.18
+
+# Quant stack (Trading-Bot-derived)
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+pandas-ta>=0.3.14b
+mplfinance>=0.12.0b0
+vaderSentiment>=3.3.2
+ta>=0.11.0
+pyyaml>=6.0
+supabase>=2.0.0
+scipy>=1.11.0
+arch>=7.0.0
+
+pytest>=8.0

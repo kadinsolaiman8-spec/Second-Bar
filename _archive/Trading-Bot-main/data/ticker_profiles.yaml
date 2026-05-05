@@ -1,0 +1,5 @@
+# External ticker profiles (Option D: Hybrid).
+# Merged with config.yaml ticker_profiles at startup.
+# config.yaml overrides same-ticker entries here.
+# Add per-ticker overrides; format matches config.yaml ticker_profiles.
+ticker_profiles: {}

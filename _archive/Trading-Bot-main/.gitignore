@@ -1,0 +1,28 @@
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE / tool config
+.idea/
+.vscode/
+.cursor/
+.claude/
+*.swp
+*.swo
+
+# Data (exclude sensitive logs/trades, keep safe config files)
+data/*
+!data/paper_eval_criteria.yaml
+!data/ticker_profiles.yaml
+
+# Logs
+*.log

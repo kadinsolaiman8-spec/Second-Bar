@@ -1,0 +1,30 @@
+# Secrets - never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE / tool config
+.idea/
+.vscode/
+.cursor/
+.claude/
+*.swp
+*.swo
+
+# Data — ignore mutable artifacts but keep shipped fixtures
+data/*
+!data/paper_eval_criteria.yaml
+!data/ticker_profiles.yaml
+!data/indices/
+!data/indices/**
+
+# Logs
+*.log
