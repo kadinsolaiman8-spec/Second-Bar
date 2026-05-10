@@ -7,7 +7,7 @@ Python application with a **FastAPI** server that serves a web dashboard ([`site
 ## Quick start
 
 ```powershell
-cd c:\Users\kadin\Downloads\tradingbotv3
+cd c:\Users\__\___\___
 pip install -r requirements.txt
 copy .env.example .env
 # optional: FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, POLYGON_API_KEY, SUPABASE_*
