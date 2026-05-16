@@ -1,5 +1,19 @@
 # Trading dashboard and research stack
 
+One program you run on your computer or server: open it in the browser and use it as a **trading assistant** for workflow and research. The same process serves the dashboard and the JSON API behind it—no separate app pair to coordinate for daily use.
+
+### Scanner (what’s live now)
+
+While markets are relevant to your setup, the scanner watches your saved symbols, applies technical and rules-based logic, and surfaces candidates with scores, checks, and context—so you can see **what looked interesting** and **why**, alongside levels and indicators when alerts exist. New passes can be kicked off from the UI or driven by your scheduler configuration.
+
+### Quant / research (historical honesty)
+
+Backtesting, walk-forward optimization (WFO), and supporting statistics live alongside the scanner in **`quant/`**. That lane answers questions like **“did this idea hold up over history?”**—a different cadence than intraday scans. Methodology and limits are documented under [`docs/`](docs/) (start with [`docs/STRATEGY_AND_EDGE.md`](docs/STRATEGY_AND_EDGE.md)); product direction and phases are summarized in [`docs/timeline.md`](docs/timeline.md).
+
+This stack is **educational tooling**: it helps you organize scans and validate ideas systematically; it does not replace your judgment, risk controls, or compliance obligations.
+
+---
+
 Python application with a **FastAPI** server that serves a web dashboard ([`site/`](site/)) and JSON APIs under `/api/*`.
 
 **`scanner_core/`** runs the market scan pipeline (regimes, indicators, scoring). **`quant/`** holds backtesting, walk-forward optimization, statistics, and data helpers. **`backend/app.py`** wires routes, static files, and API endpoints. **`tests/`** contains `pytest` suites; **`scripts/`** has pool validation and multiple-testing utilities.
