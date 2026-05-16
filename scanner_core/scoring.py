@@ -32,7 +32,7 @@ def _get_adaptive_adjustment(indicators: dict, entry_price: float) -> int:
     Returns 0 if adaptive_scoring is unavailable or has <50 trades.
     """
     try:
-        from adaptive_scoring import extract_indicator_states, get_weight, get_total_trades
+        from scanner_core.adaptive_scoring import extract_indicator_states, get_weight, get_total_trades
         if get_total_trades() < 50:
             return 0  # Not enough data yet
         if not indicators or entry_price <= 0:
@@ -45,7 +45,7 @@ def _get_adaptive_adjustment(indicators: dict, entry_price: float) -> int:
         # avg=1.0 → 0 pts, avg=2.0 → +10, avg=0.5 → -5
         adj = int((avg - 1.0) * 10)
         return max(-5, min(10, adj))
-    except Exception:
+    except ImportError:
         return 0
 
 

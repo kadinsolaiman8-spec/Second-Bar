@@ -10,11 +10,17 @@ from typing import Literal
 
 import pandas as pd
 
-from quant.data import fetch_single
+from quant.data import fetch_single, yfinance_effective_period
 from quant.indicators import compute_atr
+from quant.intraday_backtest_strategies import (
+    ALLOWED_DAY_STRATEGY_IDS,
+    day_trade_signal_at,
+    precompute_intraday,
+)
 from quant.stop import StopRequested, clear_stop, is_stop_requested
 
 logger = logging.getLogger(__name__)
+from quant.hybrid import evaluate_hybrid
 from quant.signals import evaluate_signal
 from quant.signals_trend import evaluate_breakout_signal
 
@@ -52,6 +58,8 @@ class BacktestResult:
     bar_returns: list[float] | None = None
     forced_skipped: int = 0
     profit_factor: float = 0.0
+    requested_data_period: str | None = None
+    effective_data_period: str | None = None
 
 
 def _compute_min_warmup(config: dict) -> int:
@@ -121,6 +129,9 @@ def run_backtest(
     vix_series: pd.Series | None = None,
     forced_entry_dates: set[str] | None = None,
     gold_macro_filter_series: "pd.Series | None" = None,
+    trading_mode: Literal["quant", "day_trading"] = "quant",
+    day_strategy_id: str | None = None,
+    requested_period_display: str | None = None,
 ) -> BacktestResult | None:
     """
     Run event-driven backtest for a single symbol.
@@ -128,6 +139,10 @@ def run_backtest(
     Returns None if insufficient data.
     When df is provided, use it instead of fetching (for WFO).
     vix_series: historical VIX close values indexed by date, for regime classification per bar.
+    trading_mode: ``quant`` uses config-driven mean-reversion / trend signals; ``day_trading`` uses
+        intraday rule sets from ``day_strategy_id`` (requires intraday ``interval``).
+    requested_period_display: when set (e.g. API user choice), stored on the result as the requested
+        period while ``period`` is the value used for fetching (may already be Yahoo-clamped).
     """
     config = config or {}
     bt_cfg = config.get("backtest", {})
@@ -138,11 +153,21 @@ def run_backtest(
         if min_confidence is not None
         else config.get("min_confidence", config.get("backtest", {}).get("min_confidence", 0))
     )
+    if trading_mode == "day_trading":
+        min_conf = 0
     stop_pct = bt_cfg.get("stop_pct", 0)
     take_profit_pct = bt_cfg.get("take_profit_pct", 0)
     trailing_stop_pct = bt_cfg.get("trailing_stop_pct", 0)
     trailing_stop_atr_multiplier = bt_cfg.get("trailing_stop_atr_multiplier", 0)
     max_hold_bars = bt_cfg.get("max_hold_bars", 0)
+
+    requested_data_period: str | None = None
+    effective_data_period: str | None = None
+    if df is None:
+        requested_data_period = (
+            requested_period_display.strip().lower() if requested_period_display else period
+        )
+        effective_data_period = yfinance_effective_period(period, interval)
 
     if df is None:
         logger.info("Backtest %s: fetching data (period=%s, interval=%s)", symbol, period, interval)
@@ -162,13 +187,31 @@ def run_backtest(
         atr_series = compute_atr(df["High"], df["Low"], df["Close"], window=atr_period)
 
     strategy = config.get("strategy", "mr")
-    min_warmup = _compute_min_warmup_trend(config) if strategy == "tf" else _compute_min_warmup(config)
+    precomp_day: dict | None = None
+    if trading_mode == "day_trading":
+        dsid = (day_strategy_id or "").strip()
+        if dsid not in ALLOWED_DAY_STRATEGY_IDS:
+            logger.warning(
+                "Backtest %s: day_trading mode needs a valid day_strategy_id (got %r)",
+                symbol, day_strategy_id,
+            )
+            return None
+        precomp_day = precompute_intraday(df, dsid)
+        min_warmup = int(precomp_day["min_warmup"])
+    else:
+        if strategy == "hybrid":
+            min_warmup = max(_compute_min_warmup(config), _compute_min_warmup_trend(config))
+        elif strategy == "tf":
+            min_warmup = _compute_min_warmup_trend(config)
+        else:
+            min_warmup = _compute_min_warmup(config)
 
     # Gold macro filter: DXY/TIP regime gate for GLD Donchian longs.
     # Enabled when config has trend_following.gold_macro_filter: true and symbol is GLD.
     _gold_filter: "pd.Series | None" = None
     if (
-        strategy == "tf"
+        trading_mode != "day_trading"
+        and strategy == "tf"
         and symbol.upper() == "GLD"
         and config.get("trend_following", {}).get("gold_macro_filter", False)
     ):
@@ -235,6 +278,30 @@ def run_backtest(
             # Time-based max hold
             elif max_hold_bars > 0 and entry_bar_index is not None and (i - entry_bar_index) >= max_hold_bars:
                 exit_triggered = True
+            
+            # End of day exit for day trading
+            if trading_mode == "day_trading" and next_date != str(df.index[i])[:10]:
+                # Force exit at current close to avoid overnight hold
+                fill_price = _apply_costs(current_close, commission_pct, slippage_pct, is_buy=False)
+                pnl_abs = fill_price - position
+                pnl_pct = (pnl_abs / position) * 100
+                trades.append(
+                    Trade(
+                        entry_date=entry_date or "",
+                        exit_date=str(df.index[i]),
+                        entry_price=position,
+                        exit_price=fill_price,
+                        side="long",
+                        pnl_pct=pnl_pct,
+                        pnl_abs=pnl_abs,
+                        bars_held=i - (entry_bar_index or i),
+                    )
+                )
+                position = None
+                entry_date = None
+                entry_bar_index = None
+                peak_price = None
+                continue
 
             if exit_triggered:
                 fill_price = _apply_costs(next_open, commission_pct, slippage_pct, is_buy=False)
@@ -271,7 +338,19 @@ def run_backtest(
                     bar_vix = float(vix_series.loc[mask].iloc[-1])
             except Exception:
                 pass
-        if strategy == "tf":
+        if trading_mode == "day_trading":
+            assert precomp_day is not None
+            signal = day_trade_signal_at(i, precomp_day, symbol, df)
+        elif strategy == "hybrid":
+            signal = evaluate_hybrid(
+                bar_df,
+                symbol,
+                config=config,
+                ignore_volatility=ignore_volatility,
+                timeframe=timeframe,
+                vix=bar_vix,
+            )
+        elif strategy == "tf":
             tf_cfg = config.get("trend_following", {})
             signal = evaluate_breakout_signal(
                 bar_df,
@@ -427,6 +506,8 @@ def run_backtest(
         bar_returns=bar_returns,
         forced_skipped=forced_skipped,
         profit_factor=profit_factor,
+        requested_data_period=requested_data_period,
+        effective_data_period=effective_data_period,
     )
 
 

@@ -1,5 +1,13 @@
-"""Run walk-forward optimization from the command line."""
+"""Run walk-forward optimization from the command line.
+
+WFO supports mean-reversion (mr) and trend-following (tf) strategies only.
+Hybrid is single-backtest-only: its MR+TF voting model does not reduce to a
+single-strategy parameter grid for fold optimization. Use is_wfo_supported()
+from quant.quant_strategies to check at call-time.
+"""
 import argparse
+import datetime
+import json
 import logging
 import sys
 from pathlib import Path
@@ -8,6 +16,7 @@ from typing import Any
 import yaml
 
 from quant.data import fetch_vix_series
+from quant.quant_strategies import WFO_SUPPORTED_STRATEGIES  # noqa: F401 — exported for callers
 from quant.walk_forward import (
     WalkForwardResult,
     compute_deflated_sharpe,
@@ -108,6 +117,43 @@ def _save_ticker_profile(ticker: str, profile: dict[str, Any], config_path: Path
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
 
+def _write_wfo_json(
+    output_dir: Path,
+    ticker: str,
+    strategy: str,
+    optimize_metric: str,
+    n_folds: int,
+    oos_sharpe_headline: float | None,
+    stationary_bootstrap_pvalue: float | None,
+) -> Path:
+    """Write a WFO result artifact to ``output_dir/{ticker}-{strategy}-{timestamp}.json``.
+
+    Creates ``output_dir`` if it does not exist.  Returns the written path.
+    Fields in the artifact:
+    - ticker, strategy, optimize_metric, n_folds
+    - oos_sharpe_headline: observed annualized OOS Sharpe from stationary bootstrap (or None)
+    - stationary_bootstrap_pvalue: bootstrap p-value (or None if bootstrap was skipped)
+    - timestamp_iso: UTC ISO-8601 timestamp of run completion
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc)
+    slug = ts.strftime("%Y%m%dT%H%M%SZ")
+    filename = f"{ticker.upper()}-{strategy}-{slug}.json"
+    payload: dict[str, Any] = {
+        "ticker": ticker.upper(),
+        "strategy": strategy,
+        "optimize_metric": optimize_metric,
+        "n_folds": n_folds,
+        "oos_sharpe_headline": oos_sharpe_headline,
+        "stationary_bootstrap_pvalue": stationary_bootstrap_pvalue,
+        "timestamp_iso": ts.isoformat(),
+    }
+    out_path = output_dir / filename
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return out_path
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run walk-forward optimization")
     parser.add_argument("ticker", nargs="?", default="SPY", help="Ticker symbol (e.g. XLE, SPY)")
@@ -134,7 +180,10 @@ def _parse_args() -> argparse.Namespace:
         "-s",
         default="mr",
         choices=["mr", "tf"],
-        help="Strategy: mr (mean-reversion) or tf (trend-following)",
+        # hybrid excluded: combined MR+TF voting does not map to a single param grid for WFO.
+        # Use quant.quant_strategies.is_wfo_supported() to check programmatically.
+        help="Strategy: mr (mean-reversion) or tf (trend-following). "
+             "hybrid is not supported by WFO (single-backtest only).",
     )
     parser.add_argument(
         "--permutation-test",
@@ -186,6 +235,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Parallel workers for WFO folds and permutation tests. 1=serial (default), -1=all CPUs.",
+    )
+    parser.add_argument(
+        "--emit-json",
+        metavar="DIR",
+        default=None,
+        help="If set, write a WFO result JSON to DIR/<ticker>-<strategy>-<timestamp>.json "
+             "after the run completes (creates DIR if absent). Contains ticker, strategy, "
+             "optimize_metric, n_folds, oos_sharpe_headline, stationary_bootstrap_pvalue, "
+             "and timestamp_iso. Default: no file written (backward compatible).",
     )
     return parser.parse_args()
 
@@ -396,6 +454,9 @@ def main() -> None:
 
     optimize_metric = wf_cfg.get("optimize_metric", "sharpe")
 
+    # Captured for --emit-json artifact; populated inside the bootstrap block if run.
+    _emit_boot: dict[str, Any] = {}
+
     # --- Primary: stationary bootstrap on concatenated OOS bar-P&L ---
     if results and not args.no_oos_bootstrap:
         oos_returns = concatenate_oos_bar_returns(results)
@@ -421,6 +482,7 @@ def main() -> None:
             if "error" in boot:
                 print(f"ERROR: {boot['error']}")
             else:
+                _emit_boot = boot  # capture for --emit-json artifact
                 print(f"Observed OOS Sharpe (annualized): {boot['observed_sharpe']:.3f}")
                 print(
                     f"Bootstrap block length: {boot['bootstrap_block_length']:.0f}  |  "
@@ -537,6 +599,21 @@ def main() -> None:
                     f'{"edge is statistically significant (p < 0.05)" if result["passed"] else "edge not significant (p >= 0.05)"}',
                 )
                 _print_bar_perm_strategy_caveat(args.strategy)
+
+    # --- Emit JSON artifact (--emit-json DIR) ---
+    if args.emit_json and results:
+        emit_dir = Path(args.emit_json)
+        out_path = _write_wfo_json(
+            output_dir=emit_dir,
+            ticker=ticker,
+            strategy=args.strategy,
+            optimize_metric=optimize_metric,
+            n_folds=len(results),
+            oos_sharpe_headline=_emit_boot.get("observed_sharpe"),
+            stationary_bootstrap_pvalue=_emit_boot.get("p_value"),
+        )
+        print()
+        print(f"WFO artifact written: {out_path}")
 
 
 if __name__ == "__main__":

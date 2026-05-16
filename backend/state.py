@@ -39,10 +39,22 @@ def json_safe(obj: Any) -> Any:
     return str(obj)
 
 
-def set_scan_result(signals: list[dict[str, Any]], *, ts_iso: str, error: str | None = None) -> None:
+def set_scan_result(
+    signals: list[dict[str, Any]],
+    *,
+    ts_iso: str | None = None,
+    error: str | None = None,
+) -> None:
     global _latest_signals, _last_scan_at, _last_scan_error
     _latest_signals = [json_safe(s) for s in signals]
-    _last_scan_at = ts_iso
+    _last_scan_at = ts_iso if ts_iso else None
+    _last_scan_error = error
+
+
+def set_scan_error(*, ts_iso: str | None = None, error: str | None = None) -> None:
+    """Update scan timestamps/error without clearing cached signals (failed scan path)."""
+    global _last_scan_at, _last_scan_error
+    _last_scan_at = ts_iso if ts_iso else None
     _last_scan_error = error
 
 

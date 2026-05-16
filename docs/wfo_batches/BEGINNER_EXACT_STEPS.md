@@ -33,10 +33,10 @@ The old “~15–25 minutes per ticker” note was **wrong** for this script. Ea
 
 On a typical machine, one full-history backtest in those loops is often on the order of **~2–3+ minutes**. So **1500** gate+perm backtests alone can be **~2–3+ days of wall time per MR ticker** before counting WFO. TF tickers have cheaper WFO but **the same 1000+500** full-history passes — still often **many hours each**. A **full five-ticker batch is usually a multi-day job**, not ~90–120 minutes.
 
-**Faster exploratory runs** (not for a locked prereg scorecard unless you pre-register the reduced sim counts): omit `--in-sample-gate` and/or `--permutation-test`, shorten `--period` (e.g. `5y`), and/or lower `--in-sample-sims` and `--permutation-samples` on manual `python -m src.run_wfo ...` commands. Example quick check (one ticker):
+**Faster exploratory runs** (not for a locked prereg scorecard unless you pre-register the reduced sim counts): omit `--in-sample-gate` and/or `--permutation-test`, shorten `--period` (e.g. `5y`), and/or lower `--in-sample-sims` and `--permutation-samples` on manual `python -m quant.run_wfo ...` commands. Example quick check (one ticker):
 
 ```powershell
-python -m src.run_wfo SPY --strategy mr --period 5y --permutation-test --permutation-samples 100 --in-sample-sims 200
+python -m quant.run_wfo SPY --strategy mr --period 5y --permutation-test --permutation-samples 100 --in-sample-sims 200
 ```
 
 (Adjust numbers; smaller = faster but weaker inference.)
@@ -74,7 +74,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ```powershell
 Set-Location c:\Users\kadin\DiscordTradingBot
-python -m src.run_wfo GLD --strategy tf --period 10y --in-sample-gate --permutation-test
+python -m quant.run_wfo GLD --strategy tf --period 10y --in-sample-gate --permutation-test
 ```
 
 Swap `GLD` / `tf` for `SPY` / `mr` etc. as needed.
@@ -146,7 +146,7 @@ Scroll to **## Post-run appendix** and fill in:
 
 ```powershell
 Set-Location c:\Users\kadin\DiscordTradingBot
-python -m src.run_wfo DIA --strategy mr --period 10y --in-sample-gate --permutation-test
+python -m quant.run_wfo DIA --strategy mr --period 10y --in-sample-gate --permutation-test
 ```
 
 Write DIA’s primary p-value in the prereg file under **Hold-out final run**.

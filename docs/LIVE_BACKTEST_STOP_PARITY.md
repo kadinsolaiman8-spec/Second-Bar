@@ -1,6 +1,6 @@
 # Live (embed) vs backtest stop / take-profit parity
 
-This documents how [`src/signals.py`](src/signals.py) `_compute_stop_tp_levels` (Discord `/stock` display) relates to exit logic in [`src/backtest.py`](src/backtest.py) (`run_backtest` loop).
+This documents how [`quant/signals.py`](../quant/signals.py) `_compute_stop_tp_levels` relates to exit logic in [`quant/backtest.py`](../quant/backtest.py) (`run_backtest` loop).
 
 | Config key (`backtest.*`) | Backtest behavior | Live `_compute_stop_tp_levels` | Parity |
 |---------------------------|-------------------|--------------------------------|--------|

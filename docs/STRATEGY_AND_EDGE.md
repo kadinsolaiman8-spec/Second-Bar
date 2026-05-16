@@ -78,15 +78,39 @@ The critique is correct: **WFO is doing its job**. If `min_confidence=0` wins ev
 
 ## Current WFO Configuration
 
-- **Train:** 504 bars (~2 years daily)
-- **Test:** 63 bars (~3 months)
-- **Step:** 63 bars (roll forward 3 months)
-- **Param grid:** `rsi_oversold`, `rsi_overbought`, `min_net_score`, `min_confidence`
-- **Optimization metric:** outperformance (strategy return − buy & hold return)
+See `config.yaml` `walk_forward:` section for current values (single source of truth).
+The excerpt below reflects the configuration as of the last committed state:
+
+```yaml
+# config.yaml — walk_forward section
+walk_forward:
+  optimize_metric: profit_factor
+  show_pbo: false
+  train_bars: 252
+  test_bars: 126
+  step_bars: 126
+  embargo_bars: 5
+  tf_train_bars: 756        # Daily TF only; overrides train_bars when > train_bars
+  low_power_oos_trades_total: 20
+  low_power_oos_trades_per_fold: 3
+  param_grid:               # MR: 4 combos (RSI fixed at 30/70)
+    rsi_oversold: [30]
+    rsi_overbought: [70]
+    min_net_score: [0.4, 0.5]
+    rsi_weight: [1.5, 2.0]
+    trend_weight: [0]
+  trend_following_param_grid:  # TF: 2 combos (donchian fixed at 55)
+    atr_multiplier: [2.0, 3.0]
+    adx_threshold: [null]
+    max_hold_bars: [0]
+  timeframe_overrides:      # 1H and 1W windows — see config.yaml for details
+    1H: {train_bars: 336, test_bars: 168, step_bars: 168}
+    1W: {train_bars: 52,  test_bars: 13,  step_bars: 13, tf_train_bars: 104}
+```
 
 ---
 
-## WFO validation hierarchy (`python -m src.run_wfo`)
+## WFO validation hierarchy (`python -m quant.run_wfo`)
 
 After a walk-forward run, significance testing follows [CLAUDE_SONNET_REVIEW_VERIFIED_ROADMAP.md](CLAUDE_SONNET_REVIEW_VERIFIED_ROADMAP.md):
 

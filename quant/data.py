@@ -43,6 +43,41 @@ def set_provider_config(config: dict) -> None:
     _provider_rate_limits = {k: float(v) for k, v in rl.items() if isinstance(v, (int, float)) and v > 0}
 
 
+def _cap_yfinance_period(period: str, interval: str) -> str:
+    """Cap period based on Yahoo Finance intraday retention (see yfinance docs)."""
+    interval_key = interval.strip().lower()
+    if interval_key in ("1d", "1wk", "1mo"):
+        return period.strip().lower()
+
+    days_requested = _period_to_days(period.strip().lower())
+
+    if interval_key == "1m":
+        cap = 7
+    elif interval_key in ("2m", "5m", "15m", "30m", "90m"):
+        cap = 60
+    elif interval_key in ("60m", "1h"):
+        cap = 730
+    else:
+        cap = days_requested
+
+    if days_requested > cap:
+        return f"{cap}d"
+
+    stripped = period.strip().lower()
+    if stripped in ("ytd", "max"):
+        return f"{days_requested}d"
+    if stripped.endswith("d") and stripped[:-1].isdigit():
+        return stripped
+    if stripped.endswith("mo") or stripped.endswith("y") or stripped == "1wk":
+        return f"{days_requested}d"
+    return stripped
+
+
+def yfinance_effective_period(period: str, interval: str) -> str:
+    """Period string passed to yfinance after applying intraday history limits."""
+    return _cap_yfinance_period(period, interval)
+
+
 def fetch_ohlcv(
     symbols: list[str] | None = None,
     period: str = "2mo",
@@ -62,6 +97,8 @@ def fetch_ohlcv(
     """
     if symbols is None:
         symbols = get_sp100_tickers()
+
+    period = _cap_yfinance_period(period, interval)
 
     result: dict[str, pd.DataFrame] = {}
 
@@ -216,9 +253,32 @@ def _fetch_polygon(symbol: str, period: str) -> pd.DataFrame | None:
 
 
 def _period_to_days(period: str) -> int:
-    """Convert yfinance period string to approximate days."""
-    m = {"1mo": 30, "2mo": 60, "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "5y": 1825}
-    return m.get(period, 90)
+    """Convert yfinance period string to approximate calendar days."""
+    normalized = period.strip().lower()
+    if normalized.endswith("d"):
+        core = normalized[:-1].strip()
+        try:
+            return max(1, int(core))
+        except ValueError:
+            pass
+    mapping = {
+        "1wk": 7,
+        "1mo": 30,
+        "2mo": 60,
+        "3mo": 90,
+        "6mo": 180,
+        "1y": 365,
+        "2y": 730,
+        "5y": 1825,
+        "10y": 3650,
+        "ytd": 380,
+        "max": 36500,
+        "5d": 5,
+        "1d": 1,
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    return mapping.get(normalized, mapping["1mo"])
 
 
 def _period_to_bars(period: str) -> int:

@@ -69,8 +69,14 @@ def _last(series, default=0.0):
 
 def calc_rsi(df: pd.DataFrame) -> dict:
     """Relative Strength Index (14-period)."""
-    result = {"value": 50.0, "bullish": False, "bearish": False,
-              "overbought": False, "oversold": False}
+    result = {
+        "value": 50.0,
+        "prev_value": 50.0,
+        "bullish": False,
+        "bearish": False,
+        "overbought": False,
+        "oversold": False,
+    }
     try:
         close = df["Close"]
         if len(close) < RSI_PERIOD + 1:
@@ -88,6 +94,11 @@ def calc_rsi(df: pd.DataFrame) -> dict:
             val = _last(rsi_s, 50.0)
 
         result["value"] = round(val, 2)
+        rsi_clean = rsi_s.dropna()
+        if len(rsi_clean) >= 2:
+            result["prev_value"] = round(float(rsi_clean.iloc[-2]), 2)
+        else:
+            result["prev_value"] = result["value"]
         result["overbought"] = val >= RSI_OVERBOUGHT
         result["oversold"] = val <= RSI_OVERSOLD
         result["bullish"] = 40 < val < RSI_OVERBOUGHT
@@ -115,9 +126,15 @@ def calc_rsi(df: pd.DataFrame) -> dict:
 # ══════════════════════════════════════════════════════════════════════════
 
 def calc_macd(df: pd.DataFrame) -> dict:
-    result = {"macd": 0.0, "signal": 0.0, "histogram": 0.0,
-              "bullish": False, "bearish": False,
-              "candles_since_crossover": 999}
+    result = {
+        "macd": 0.0,
+        "signal": 0.0,
+        "histogram": 0.0,
+        "prev_histogram": 0.0,
+        "bullish": False,
+        "bearish": False,
+        "candles_since_crossover": 999,
+    }
     try:
         close = df["Close"]
         if len(close) < MACD_SLOW + MACD_SIGNAL:
@@ -145,6 +162,18 @@ def calc_macd(df: pd.DataFrame) -> dict:
         result["macd"] = round(macd_val, 6)
         result["signal"] = round(signal_val, 6)
         result["histogram"] = round(hist_val, 6)
+
+        prev_histogram = hist_val
+        if HAS_PANDAS_TA and macd_df is not None and not macd_df.empty:
+            hist_series = macd_df[cols[2]].dropna()
+            if len(hist_series) >= 2:
+                prev_histogram = float(hist_series.iloc[-2])
+        elif not HAS_PANDAS_TA:
+            hist_series = hist_line.dropna()
+            if len(hist_series) >= 2:
+                prev_histogram = float(hist_series.iloc[-2])
+        result["prev_histogram"] = round(prev_histogram, 6)
+
         result["bullish"] = macd_val > signal_val
         result["bearish"] = macd_val < signal_val
 
@@ -328,14 +357,37 @@ def calc_vwap(df: pd.DataFrame) -> dict:
         if "Volume" not in df.columns or df["Volume"].sum() == 0:
             return result
 
-        # Determine session start
         typical = (df["High"] + df["Low"] + df["Close"]) / 3
-        cum_vol = df["Volume"].cumsum()
-        cum_tp_vol = (typical * df["Volume"]).cumsum()
 
-        # Avoid division by zero
-        cum_vol_safe = cum_vol.replace(0, np.nan)
-        vwap_s = cum_tp_vol / cum_vol_safe
+        # Detect intraday data: DatetimeIndex whose median bar gap is sub-daily
+        is_intraday = False
+        if isinstance(df.index, pd.DatetimeIndex) and len(df) >= 2:
+            median_gap = float(
+                pd.Series(df.index).diff().dropna().median().total_seconds()
+            )
+            is_intraday = 0 < median_gap < 86400  # any sub-daily bar (1m … 1h)
+
+        if is_intraday:
+            # Convert index to ET to get calendar-date session labels
+            idx = df.index
+            if idx.tz is None:
+                idx_et = idx.tz_localize("UTC").tz_convert(ET)
+            else:
+                idx_et = idx.tz_convert(ET)
+
+            # Group by ET calendar date; cumsum resets at each session boundary
+            date_labels = pd.Series(idx_et.date, index=df.index)
+            tp_vol = typical * df["Volume"]
+            cum_tp_vol = tp_vol.groupby(date_labels).cumsum()
+            cum_vol = df["Volume"].groupby(date_labels).cumsum()
+            cum_vol_safe = cum_vol.replace(0, np.nan)
+            vwap_s = cum_tp_vol / cum_vol_safe
+        else:
+            # Daily or non-intraday: cumulative across all bars (unchanged)
+            cum_vol = df["Volume"].cumsum()
+            cum_tp_vol = (typical * df["Volume"]).cumsum()
+            cum_vol_safe = cum_vol.replace(0, np.nan)
+            vwap_s = cum_tp_vol / cum_vol_safe
 
         val = _last(vwap_s)
         price = _sf(df["Close"].iloc[-1])
@@ -513,6 +565,7 @@ def calc_bollinger(df: pd.DataFrame) -> dict:
 
         result["bullish"] = price > mid
         result["bearish"] = price < mid
+        result["price"] = round(price, 4)
 
     except Exception as e:
         logger.debug(f"BB calc error: {e}")
@@ -693,7 +746,7 @@ def _empty_indicators() -> dict:
         "vwap":       {"value": 0, "above": False, "bullish": False, "bearish": False, "distance_pct": 0},
         "adx":        {"value": 0, "plus_di": 0, "minus_di": 0, "bullish": False, "bearish": False, "trending": False},
         "atr":        {"value": 0, "bullish": False, "bearish": False, "pct": 0},
-        "bollinger":  {"upper": 0, "middle": 0, "lower": 0, "width": 0, "pct_b": 0.5, "squeeze": False, "bullish": False, "bearish": False},
+        "bollinger":  {"upper": 0, "middle": 0, "lower": 0, "width": 0, "pct_b": 0.5, "squeeze": False, "bullish": False, "bearish": False, "price": 0.0},
         "rvol":       {"rvol": 1.0, "bullish": False, "bearish": False, "increasing_3": False, "current_vol": 0, "avg_vol": 0},
         "williams_r": {"value": -50, "bullish": False, "bearish": False, "overbought": False, "oversold": False},
         "obv":        {"trending_up": False, "bullish": False, "bearish": False},

@@ -3,9 +3,11 @@
 import asyncio
 import logging
 import math
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable, Callable
 from typing import Optional
 
 import numpy as np
@@ -48,7 +50,7 @@ from scanner_core.indicators import (
 )
 from scanner_core.strategies import detect_strategy
 from scanner_core.scoring import calculate_full_score, classify_threshold
-from scanner_core.regime import get_current_regime, is_strategy_enabled
+from scanner_core.regime import get_current_regime, is_strategy_enabled, update_regime
 from scanner_core.market_state import (
     get_current_market_state, check_alert_rate_limit, record_alert_sent,
     get_min_confidence_for_state, get_state_label,
@@ -92,6 +94,7 @@ scan_history: list = []       # ring buffer of scan events
 _quiet_mode: bool = False
 _min_confidence: int = 0
 _orb_computed: bool = False
+_orb_date_et = None  # Last ORB calendar date (ET); triggers daily cache reset
 
 # Dynamic delisted / broken ticker detection
 _fetch_fail_count: dict = {}  # {ticker: consecutive_failure_count}
@@ -551,6 +554,9 @@ async def fetch_ohlcv_async(ticker: str, timeframe: str) -> Optional[pd.DataFram
     return await loop.run_in_executor(_executor, _fetch_ohlcv, ticker, timeframe)
 
 
+_DAY_COUNT_PERIOD_RE = re.compile(r"^(\d+)d$")
+
+
 def fetch_ticker_data(ticker: str, period: str = "5d",
                       interval: str = "5m") -> Optional[pd.DataFrame]:
     """
@@ -560,13 +566,30 @@ def fetch_ticker_data(ticker: str, period: str = "5d",
     if ticker in _delisted_cache:
         return None
     try:
-        df = yf.download(ticker, period=period, interval=interval,
-                         progress=False, auto_adjust=True)
-        if df is None or df.empty:
+        history_common = dict(
+            interval=interval,
+            auto_adjust=True,
+            prepost=False,
+            actions=False,
+        )
+        dm = _DAY_COUNT_PERIOD_RE.match(period.strip().lower())
+        if dm:
+            n_days = max(1, int(dm.group(1)))
+            end_ts = datetime.now(timezone.utc)
+            start_ts = end_ts - timedelta(days=n_days)
+            frame_hist = yf.Ticker(ticker).history(start=start_ts, end=end_ts, **history_common)
+        else:
+            frame_hist = yf.Ticker(ticker).history(period=period, **history_common)
+        if frame_hist is None or frame_hist.empty:
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+        if isinstance(frame_hist.columns, pd.MultiIndex):
+            frame_hist.columns = frame_hist.columns.get_level_values(0)
+        need_cols = ["Open", "High", "Low", "Close", "Volume"]
+        if not all(col in frame_hist.columns for col in need_cols):
+            return None
+        out = frame_hist[need_cols].copy()
+        out["Volume"] = pd.to_numeric(out["Volume"], errors="coerce").fillna(0)
+        return out.dropna(subset=["Open", "High", "Low", "Close"], how="any")
     except Exception as e:
         logger.debug(f"fetch_ticker_data error {ticker}: {e}")
         return None
@@ -574,10 +597,18 @@ def fetch_ticker_data(ticker: str, period: str = "5d",
 
 async def fetch_all_timeframes(ticker: str) -> dict:
     """Fetch 1m, 5m, 15m, 1h DataFrames in parallel."""
-    tasks = {tf: fetch_ohlcv_async(ticker, tf) for tf in TIMEFRAMES}
-    results = {}
-    for tf, coro in tasks.items():
-        results[tf] = await coro
+    timeframes_ordered = list(TIMEFRAMES)
+    frames = await asyncio.gather(
+        *[fetch_ohlcv_async(ticker, timeframe_name) for timeframe_name in timeframes_ordered],
+        return_exceptions=True,
+    )
+    results: dict = {}
+    for timeframe_name, frame in zip(timeframes_ordered, frames, strict=True):
+        if isinstance(frame, BaseException):
+            logger.debug(f"Fetch {ticker} {timeframe_name}: {frame}")
+            results[timeframe_name] = None
+        else:
+            results[timeframe_name] = frame
     return results
 
 
@@ -601,7 +632,7 @@ def _compute_orb_levels(df_5m: pd.DataFrame) -> dict:
     Uses 5m bars between 9:30 and 9:45 AM ET.
     """
     if df_5m is None or df_5m.empty:
-        return {"high": None, "low": None, "computed": False}
+        return {"high": None, "low": None, "computed": False, "complete": False}
 
     try:
         idx = df_5m.index
@@ -620,16 +651,17 @@ def _compute_orb_levels(df_5m: pd.DataFrame) -> dict:
         orb_bars = df_5m.loc[mask]
 
         if orb_bars.empty or len(orb_bars) < 2:
-            return {"high": None, "low": None, "computed": False}
+            return {"high": None, "low": None, "computed": False, "complete": False}
 
         return {
             "high": float(orb_bars["High"].max()),
             "low": float(orb_bars["Low"].min()),
             "computed": True,
+            "complete": True,
         }
     except Exception as e:
         logger.debug(f"ORB compute error: {e}")
-        return {"high": None, "low": None, "computed": False}
+        return {"high": None, "low": None, "computed": False, "complete": False}
 
 
 async def compute_orb_for_all(tickers: list):
@@ -647,7 +679,10 @@ async def compute_orb_for_all(tickers: list):
 
 def get_orb_data(ticker: str) -> dict:
     """Return cached ORB levels for a ticker."""
-    return orb_data.get(ticker.upper(), {"high": None, "low": None, "computed": False})
+    return orb_data.get(
+        ticker.upper(),
+        {"high": None, "low": None, "computed": False, "complete": False},
+    )
 
 
 def reset_orb_data():
@@ -945,7 +980,9 @@ def _passes_regime_filter(ticker: str, direction: str, score: int,
 def _store_state(ticker: str, price: float, indicators: dict,
                  score_data: dict, direction: str, strategy_name: str,
                  bullish_count: int, bearish_count: int,
-                 change_pct: float = 0.0):
+                 change_pct: float = 0.0,
+                 stop: float | None = None,
+                 tp1: float | None = None):
     """Store scan result in ticker_state cache.
     If score_data has total=0 but we have indicators, compute a quick score
     so /watchlist and /best always show real values."""
@@ -972,9 +1009,10 @@ def _store_state(ticker: str, price: float, indicators: dict,
         except Exception:
             pass
 
-    ticker_state[ticker] = {
+    row = {
         "ticker": ticker,
         "price": price,
+        "entry_price": price,
         "change_pct": change_pct,
         "direction": direction,
         "strategy": strategy_name if strategy_name and strategy_name != "None" else "",
@@ -989,6 +1027,11 @@ def _store_state(ticker: str, price: float, indicators: dict,
         "last_scan": datetime.now(ET).strftime("%H:%M:%S"),
         "prev_score": old_score,  # For confidence trend arrows
     }
+    if stop is not None:
+        row["stop"] = stop
+    if tp1 is not None:
+        row["tp1"] = tp1
+    ticker_state[ticker] = row
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1012,6 +1055,31 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
     try:
         if not is_market_open():
             logger.debug(f"{ticker}: market closed; trade scans are disabled.")
+            try:
+                data = await fetch_all_timeframes(ticker)
+                df_5m = data.get("5m")
+                if df_5m is not None and not df_5m.empty and len(df_5m) >= 2:
+                    price = float(df_5m["Close"].iloc[-1])
+                    prev_close = float(df_5m["Close"].iloc[-2])
+                    change_pct = round(
+                        ((price - prev_close) / prev_close * 100) if prev_close else 0.0,
+                        2,
+                    )
+                    indicators = _run_indicators_safe(df_5m)
+                    if indicators:
+                        _store_state(
+                            ticker,
+                            price,
+                            indicators,
+                            {},
+                            "NEUTRAL",
+                            "",
+                            0,
+                            0,
+                            change_pct,
+                        )
+            except Exception:
+                pass
             return None
 
         # ── Step 1: Fetch data ──────────────────────────────────────────
@@ -1241,7 +1309,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             print(f"  [GATE] {ticker}: Sector ETF too far below VWAP — suppressed")
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
         if sector_penalty > 0:
             total_score = max(0, total_score - sector_penalty)
@@ -1263,7 +1331,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
                                      bullish_count, strategy_name):
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # ── Step 8: Anti-late-entry filters ─────────────────────────────
@@ -1275,13 +1343,13 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         if is_muted(ticker):
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         if is_in_cooldown(ticker, direction):
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         check_reversal_reset(ticker, entry_price)
@@ -1290,7 +1358,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         if not _passes_rs_filter(ticker, df_5m, df_15m, direction):
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # ── Quality Gates (FIX 5) ──────────────────────────────────────
@@ -1300,7 +1368,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             print(f"  [GATE] {ticker}: Failed Gate 5 — RSI {rsi_val:.0f} (overextended)")
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # GATE 7: Minimum R:R ratio 1.8:1
@@ -1308,13 +1376,13 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             print(f"  [GATE] {ticker}: Failed Gate 7 — R:R {rr:.2f} < 1.8 minimum")
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # ── Store and determine if alertable ────────────────────────────
         _store_state(ticker, entry_price, indicators, score_data,
                      direction, strategy_name, bullish_count,
-                     bearish_count, change_pct)
+                     bearish_count, change_pct, stop=stop, tp1=tp1)
 
         if total_score < CONFIDENCE_WATCHLIST:
             return None
@@ -1345,7 +1413,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         if is_midday_quiet():
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # ── Alert deduplication ────────────────────────────────────────
@@ -1353,7 +1421,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             logger.debug(f"{ticker} alert dedup — sent too recently")
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # ── Score must be rising to re-alert ───────────────────────────
@@ -1361,7 +1429,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             logger.debug(f"{ticker} score not rising enough to re-alert")
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
-                         bearish_count, change_pct)
+                         bearish_count, change_pct, stop=stop, tp1=tp1)
             return None
 
         # Record the alert being sent
@@ -1407,15 +1475,29 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         return None
 
 
-async def scan_all_tickers(tickers: list, alert_channel=None) -> list:
+ScanProgressCallback = Callable[[dict[str, object]], Awaitable[None]]
+
+
+async def scan_all_tickers(
+    tickers: list,
+    alert_channel=None,
+    on_scan_progress: ScanProgressCallback | None = None,
+) -> list:
     """
     Scan the entire watchlist using parallel async tasks.
     Returns list of signal dicts for stocks that passed all filters.
     """
+    global _orb_date_et
     import os
     signals = []
     now_str = datetime.now(ET).strftime("%H:%M:%S")
     scan_start = time.time()
+
+    # Reset ORB cache when the ET calendar date rolls over (process stays up across days)
+    today_et = datetime.now(ET).date()
+    if _orb_date_et != today_et:
+        reset_orb_data()
+        _orb_date_et = today_et
 
     if _is_orb_window() and not _orb_computed:
         await compute_orb_for_all(tickers[:20])
@@ -1434,6 +1516,8 @@ async def scan_all_tickers(tickers: list, alert_channel=None) -> list:
         except Exception:
             vix_val = 0
         update_regime_quality(spy_ind, vix_val)
+        # Update regime label from SPY data before per-ticker loop consumes it
+        update_regime(spy_5m)
         # Update market state (non-blocking, uses cached data)
         try:
             from scanner_core.market_state import update_market_state
@@ -1454,6 +1538,19 @@ async def scan_all_tickers(tickers: list, alert_channel=None) -> list:
                 continue
             if result is not None:
                 signals.append(result)
+
+        scanned_count = min(i + len(batch), len(tickers))
+        if on_scan_progress is not None:
+            try:
+                await on_scan_progress({
+                    "scanned_count": scanned_count,
+                    "total_count": len(tickers),
+                    "current_batch": list(batch),
+                    "elapsed_seconds": round(time.time() - scan_start, 2),
+                    "signals_so_far": len(signals),
+                })
+            except Exception:
+                logger.debug("on_scan_progress callback failed", exc_info=True)
 
         if i + batch_size < len(tickers):
             await asyncio.sleep(BATCH_SLEEP_SECONDS)
@@ -1596,8 +1693,9 @@ def _identify_weakness(indicators: dict, score_data: dict) -> str:
 
 
 def get_best_stocks(min_score: int = 0, limit: int = 5) -> list:
-    """Return top-scoring stocks from cache. Always returns up to `limit`
-    stocks even if none meet `min_score` — sorted by score descending."""
+    """Return top-scoring stocks from cache.
+    When ``min_score`` > 0, prefer rows meeting that threshold; if none qualify,
+    fall back to top-by-score so callers always get up to ``limit`` rows."""
     all_stocks = get_all_watchlist_stocks()
     candidates = []
     for s in all_stocks:
@@ -1605,9 +1703,34 @@ def get_best_stocks(min_score: int = 0, limit: int = 5) -> list:
         strategy = s.get("strategy", "")
         if not strategy or strategy == "None":
             strategy = "No Active Setup"
-        candidates.append({
+        ts = ticker_state.get(s["ticker"], {}) or {}
+        entry_px = ts.get("entry_price")
+        if entry_px is None:
+            entry_px = ts.get("price", 0)
+        stop_val = ts.get("stop")
+        if stop_val is None:
+            stop_val = 0.0
+        tp1_val = ts.get("tp1")
+        if tp1_val is None:
+            tp1_val = 0.0
+        try:
+            entry_f = float(entry_px)
+        except (TypeError, ValueError):
+            entry_f = 0.0
+        try:
+            stop_f = float(stop_val)
+        except (TypeError, ValueError):
+            stop_f = 0.0
+        try:
+            tp1_f = float(tp1_val)
+        except (TypeError, ValueError):
+            tp1_f = 0.0
+        row = {
             "ticker": s["ticker"],
             "price": s.get("price", 0),
+            "entry_price": entry_f,
+            "stop": stop_f,
+            "tp1": tp1_f,
             "score": score,
             "direction": s.get("direction", "NEUTRAL"),
             "strategy": strategy,
@@ -1616,8 +1739,13 @@ def get_best_stocks(min_score: int = 0, limit: int = 5) -> list:
                 ticker_state.get(s["ticker"], {}).get("indicators", {}),
                 ticker_state.get(s["ticker"], {}).get("score_data", {}),
             ),
-        })
+        }
+        candidates.append(row)
     candidates.sort(key=lambda x: x["score"], reverse=True)
+    if min_score > 0:
+        above_min = [c for c in candidates if c["score"] >= min_score]
+        if above_min:
+            return above_min[:limit]
     return candidates[:limit]
 
 
@@ -1991,12 +2119,13 @@ def set_min_confidence(threshold: int) -> int:
 
 def reset_scanner():
     """Reset all scanner state."""
-    global _orb_computed, _quiet_mode, _min_confidence
+    global _orb_computed, _quiet_mode, _min_confidence, _orb_date_et
     ticker_state.clear()
     spy_cache.clear()
     orb_data.clear()
     scan_history.clear()
     _orb_computed = False
+    _orb_date_et = None
     _quiet_mode = False
     _min_confidence = 0
     logger.info("Scanner state reset")

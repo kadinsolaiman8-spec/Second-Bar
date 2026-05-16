@@ -237,6 +237,14 @@ def close_trade(trade_id: str, exit_price: float, exit_reason: str,
 
     logger.info(f"Trade closed: {trade_id} {trade['ticker']} {exit_reason} "
                 f"R={'+' if r >= 0 else ''}{r:.2f}")
+
+    try:
+        from scanner_core.scanner import record_trade_result as record_trade_for_breaker
+
+        record_trade_for_breaker(is_win)
+    except Exception:
+        pass
+
     return trade
 
 
@@ -506,6 +514,146 @@ def get_journal_summary() -> str:
         f"Total R: {'+' if s['total_r_gained'] >= 0 else ''}{s['total_r_gained']:.2f}R",
     ]
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PERSISTENCE (SQLite via backend.persistence)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _trade_for_json_export(trade: dict) -> dict:
+    exported = dict(trade)
+    for time_key in ("entry_time", "exit_time"):
+        value = exported.get(time_key)
+        if isinstance(value, datetime):
+            exported[time_key] = value.isoformat()
+    return exported
+
+
+def _trade_from_json_loaded(trade: dict) -> dict:
+    hydrated = dict(trade)
+    for time_key in ("entry_time", "exit_time"):
+        raw = hydrated.get(time_key)
+        if raw is None:
+            continue
+        if isinstance(raw, datetime):
+            continue
+        if isinstance(raw, str):
+            normalized = raw
+            if len(normalized) > 10 and normalized[-1:] == "Z" and "+" not in normalized[-6:]:
+                normalized = normalized.replace("Z", "+00:00", 1)
+            hydrated[time_key] = datetime.fromisoformat(normalized)
+    return hydrated
+
+
+def _daily_stats_exportable(stats: dict) -> dict:
+    clone = dict(stats)
+    for trade_key in ("best_trade", "worst_trade"):
+        nested = clone.get(trade_key)
+        if isinstance(nested, dict):
+            clone[trade_key] = _trade_for_json_export(nested)
+        else:
+            clone[trade_key] = nested
+    return clone
+
+
+def _daily_stats_from_loaded(payload: dict) -> None:
+    reset_daily_stats()
+    for scalar_key in (
+        "total_alerts_today", "total_trades_closed", "wins", "losses", "time_exits",
+        "win_rate", "avg_r", "profit_factor", "expectancy",
+        "current_streak", "current_streak_type",
+        "longest_win_streak", "longest_loss_streak", "total_r_gained",
+    ):
+        if scalar_key in payload:
+            daily_stats[scalar_key] = payload[scalar_key]
+
+    strat_in = payload.get("strategy_stats")
+    if isinstance(strat_in, dict):
+        for strat_name, strat_row in strat_in.items():
+            if isinstance(strat_row, dict) and strat_name in daily_stats["strategy_stats"]:
+                daily_stats["strategy_stats"][strat_name].update(
+                    {
+                        "wins": int(strat_row.get("wins") or 0),
+                        "losses": int(strat_row.get("losses") or 0),
+                        "r_sum": float(strat_row.get("r_sum") or 0.0),
+                    }
+                )
+
+    type_in = payload.get("type_stats")
+    if isinstance(type_in, dict):
+        for type_name in ("stable", "volatile"):
+            row = type_in.get(type_name)
+            if isinstance(row, dict):
+                bucket = daily_stats["type_stats"].setdefault(
+                    type_name, {"wins": 0, "losses": 0, "r_sum": 0.0}
+                )
+                bucket.update(
+                    {
+                        "wins": int(row.get("wins") or 0),
+                        "losses": int(row.get("losses") or 0),
+                        "r_sum": float(row.get("r_sum") or 0.0),
+                    }
+                )
+
+    best_raw = payload.get("best_trade")
+    daily_stats["best_trade"] = _trade_from_json_loaded(best_raw) if isinstance(best_raw, dict) else None
+    worst_raw = payload.get("worst_trade")
+    daily_stats["worst_trade"] = (
+        _trade_from_json_loaded(worst_raw) if isinstance(worst_raw, dict) else None
+    )
+
+
+def dump_for_persistence() -> dict:
+    return {
+        "open_trades": {
+            trade_id_str: _trade_for_json_export(trade_blob)
+            for trade_id_str, trade_blob in open_trades.items()
+        },
+        "closed_trades": [_trade_for_json_export(blob) for blob in closed_trades],
+        "daily_stats": _daily_stats_exportable(daily_stats),
+    }
+
+
+def load_from_persistence(payload: dict) -> None:
+    global open_trades, closed_trades
+    assert isinstance(payload, dict)
+    open_trades.clear()
+    closed_trades.clear()
+    open_blob = payload.get("open_trades") or {}
+    if isinstance(open_blob, dict):
+        for trade_identifier, trade_blob in open_blob.items():
+            if isinstance(trade_blob, dict):
+                open_trades[str(trade_identifier)] = _trade_from_json_loaded(trade_blob)
+    closed_blob = payload.get("closed_trades") or []
+    if isinstance(closed_blob, list):
+        for trade_blob in closed_blob:
+            if isinstance(trade_blob, dict):
+                closed_trades.append(_trade_from_json_loaded(trade_blob))
+    ds_in = payload.get("daily_stats")
+    if isinstance(ds_in, dict):
+        _daily_stats_from_loaded(ds_in)
+
+
+def equity_curve_series() -> list[dict]:
+    running_r = 0.0
+    points: list[dict] = []
+    for closed_trade in closed_trades:
+        running_r += float(closed_trade.get("r_multiple") or 0.0)
+        exit_time_raw = closed_trade.get("exit_time")
+        ts_label = ""
+        if isinstance(exit_time_raw, datetime):
+            ts_label = exit_time_raw.isoformat()
+        elif isinstance(exit_time_raw, str):
+            ts_label = exit_time_raw
+        points.append(
+            {
+                "trade_id": closed_trade.get("trade_id", ""),
+                "cumulative_r": round(running_r, 4),
+                "exit_time": ts_label,
+                "pnl_pct": closed_trade.get("pnl_pct"),
+            }
+        )
+    return points
 
 
 # ══════════════════════════════════════════════════════════════════════════

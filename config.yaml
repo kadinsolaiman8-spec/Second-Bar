@@ -1,10 +1,11 @@
-guild_id: 1476735819522900031
-channel_id: 1476735820215091204
-recap_interval_minutes: 30
-recap_queue:
-  max_size: 3
+# Discord (legacy — unused by web stack)
+# guild_id: 1476735819522900031
+# channel_id: 1476735820215091204
+# recap_interval_minutes: 30
+# recap_queue:
+#   max_size: 3
+# recap_timeframe: Daily
 min_confidence: 60
-recap_timeframe: Daily
 show_signal_breakdown: false
 charts:
   enabled: true
