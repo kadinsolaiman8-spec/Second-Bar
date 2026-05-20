@@ -13,6 +13,22 @@
             document.documentElement.setAttribute("data-theme", stored);
           }
         } catch (_) {}
+        try {
+          var speed = parseInt(localStorage.getItem("tb_motion_speed"), 10);
+          if (!isNaN(speed) && speed >= 0 && speed <= 200) {
+            var scale = speed === 0 ? 0 : speed / 100;
+            document.documentElement.style.setProperty("--motion-scale", String(scale));
+            if (scale === 0) {
+              document.documentElement.setAttribute("data-motion", "reduced");
+            }
+          }
+        } catch (_) {}
+        try {
+          var font = localStorage.getItem("tb_font_size");
+          if (font === "small" || font === "medium" || font === "large") {
+            document.documentElement.setAttribute("data-font-size", font);
+          }
+        } catch (_) {}
       })();
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -59,7 +75,7 @@
                     <path d="M6 4h11a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9l-5 4V6a2 2 0 0 1 2-2z" />
                   </g>
                   <g class="nav-icon-fill" fill="currentColor">
-                    <path d="M8 10h11v1.75H8V10Zm0 3.5h11v1.75H8V13.5Zm0 3.5h7v1.75H8V17Z" />
+                    <path d="M6 4h11a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9l-5 4V6a2 2 0 0 1 2-2z" />
                   </g>
                 </svg>
                 <span class="nav-label">Paper journal</span>
@@ -89,6 +105,40 @@
                   </g>
                 </svg>
                 <span class="nav-label">Backtest</span>
+              </button>
+              <span class="nav-drag-handle" role="button" tabindex="-1" aria-label="Drag to reorder tab" title="Drag to reorder">
+                <svg class="nav-drag-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none">
+                  <path
+                    d="M9 10l3-3 3 3M9 14l3 3 3-3"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </span>
+            </div>
+            <div class="nav-row nav-row--reorderable" data-nav-section="settings">
+              <button class="nav-button" type="button" data-section="settings">
+                <svg class="nav-icon" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+                  <g class="nav-icon-stroke" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16" />
+                    <circle cx="9" cy="7" r="2.1" />
+                    <path d="M4 12h16" />
+                    <circle cx="15" cy="12" r="2.1" />
+                    <path d="M4 17h16" />
+                    <circle cx="11" cy="17" r="2.1" />
+                  </g>
+                  <g class="nav-icon-fill" fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7h16" />
+                    <circle cx="9" cy="7" r="2.35" fill="currentColor" stroke="none" />
+                    <path d="M4 12h16" />
+                    <circle cx="15" cy="12" r="2.35" fill="currentColor" stroke="none" />
+                    <path d="M4 17h16" />
+                    <circle cx="11" cy="17" r="2.35" fill="currentColor" stroke="none" />
+                  </g>
+                </svg>
+                <span class="nav-label">Settings</span>
               </button>
               <span class="nav-drag-handle" role="button" tabindex="-1" aria-label="Drag to reorder tab" title="Drag to reorder">
                 <svg class="nav-drag-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true" fill="none">
@@ -135,25 +185,6 @@
           </button>
         </div>
 
-        <div class="theme-controls">
-          <p class="theme-controls-title" id="theme-controls-title">Appearance</p>
-          <button
-            type="button"
-            class="theme-toggle"
-            id="themeToggle"
-            aria-labelledby="theme-controls-title theme-toggle-state-label"
-            aria-describedby="theme-toggle-hint"
-            aria-pressed="false"
-          >
-            <span class="theme-toggle-row">
-              <span class="theme-toggle-state-label" id="theme-toggle-state-label">Light mode</span>
-              <span class="theme-toggle-track" aria-hidden="true">
-                <span class="theme-toggle-thumb"></span>
-              </span>
-            </span>
-          </button>
-          <p class="visually-hidden" id="theme-toggle-hint">Switches between light and dark color themes. Choice is saved in this browser.</p>
-        </div>
       </aside>
 
       <main class="main">
@@ -189,6 +220,7 @@
           <div class="market-pill" id="topMarketPill">Checking market...</div>
         </header>
 
+        <div class="main-pages">
         <!-- Home: session clock + scanner -->
         <section class="page active live-desk" id="live" aria-label="Home · market clock and scanner">
           <article class="market-panel market-panel-hero" id="marketPanel">
@@ -203,7 +235,7 @@
                   <span id="etTime" class="market-now-time">—</span>
                 </div>
                 <p id="marketSessionHint" class="market-session-hint">
-                  Regular hours: Mon–Fri 9:30–16:00 ET. US holidays and early closes aren’t shown yet.
+                  Regular hours reflect the market calendar, including holidays and early closes.
                 </p>
               </div>
             </div>
@@ -257,6 +289,14 @@
                 Symbols below open the chart for that ticker (short ranges only). The table lists only symbols you save here. Stored in this browser.
               </p>
             </div>
+            <p
+              id="homeSampleDataBanner"
+              class="home-sample-data-banner alerts-notice closed"
+              role="status"
+              hidden
+            >
+              Sample data—start the server
+            </p>
             <p class="home-scanner-lede" id="homeScannerImplementationNote"></p>
             <p class="visually-hidden" id="sseStatusHint" aria-live="polite">
               Scanner updates while this page stays connected.
@@ -287,6 +327,12 @@
                 <ul class="dash-list" id="homeMoversList"></ul>
               </article>
             </div>
+            <div class="dashboard-context-grid dashboard-context-grid--orb-only" aria-label="Market context">
+              <article class="dashboard-metric-card scan-context-panel" aria-label="Opening range breakouts">
+                <p class="eyebrow dashboard-card-eyebrow">Opening range</p>
+                <div id="homeScanContextOrb" class="scan-context-body"></div>
+              </article>
+            </div>
             <div class="scanner-table-wrap" id="scannerTableWrap">
               <table class="scanner-table">
                 <thead>
@@ -300,6 +346,42 @@
                 </thead>
                 <tbody id="homeScannerRows"></tbody>
               </table>
+            </div>
+            <div class="home-context-collapsibles" aria-label="Market context">
+              <article
+                class="dashboard-metric-card scan-context-panel dashboard-collapsible"
+                id="homeScanContextSqueezeShell"
+                aria-label="Tight range watchlist"
+              >
+                <button
+                  type="button"
+                  class="dashboard-collapsible-trigger"
+                  id="homeScanContextSqueezeTrigger"
+                  aria-expanded="false"
+                  aria-controls="homeScanContextSqueeze"
+                >
+                  <span class="dashboard-collapsible-chevron" aria-hidden="true"></span>
+                  <span class="dashboard-collapsible-title">Quiet &amp; coiling</span>
+                </button>
+                <div id="homeScanContextSqueeze" class="scan-context-body dashboard-collapsible-body" hidden></div>
+              </article>
+              <article
+                class="dashboard-metric-card scan-context-panel dashboard-collapsible"
+                id="homeScanContextSectorsShell"
+                aria-label="Sector rotation"
+              >
+                <button
+                  type="button"
+                  class="dashboard-collapsible-trigger"
+                  id="homeScanContextSectorsTrigger"
+                  aria-expanded="false"
+                  aria-controls="homeScanContextSectors"
+                >
+                  <span class="dashboard-collapsible-chevron" aria-hidden="true"></span>
+                  <span class="dashboard-collapsible-title">Sectors</span>
+                </button>
+                <div id="homeScanContextSectors" class="scan-context-body dashboard-collapsible-body" hidden></div>
+              </article>
             </div>
             <div class="scanner-feed-mock" id="homeScannerSignalFeed" aria-label="Scanner signal feed"></div>
           </section>
@@ -448,8 +530,102 @@
           </article>
           <article class="stock-detail-card" id="stockDetailCard">
             <p class="eyebrow">Ticker analysis</p>
+            <div id="stockSymbolResearchCta" class="symbol-research-cta-row" hidden></div>
             <div id="stockDetailBody" class="stock-detail-body"><p class="scanner-feed-empty">Loading…</p></div>
           </article>
+        </section>
+
+        <section class="page settings-desk" id="settings" aria-label="Settings">
+          <div class="settings-stack">
+            <div class="settings-group">
+              <p class="settings-group-title" id="theme-controls-title">Appearance</p>
+              <div class="settings-row settings-row--toggle">
+                <span class="settings-row-label">Color theme</span>
+                <button
+                  type="button"
+                  class="theme-toggle theme-toggle--settings"
+                  id="themeToggle"
+                  aria-labelledby="theme-controls-title theme-toggle-state-label"
+                  aria-describedby="theme-toggle-hint"
+                  aria-pressed="false"
+                >
+                  <span class="theme-toggle-row">
+                    <span class="theme-toggle-state-label" id="theme-toggle-state-label">Light mode</span>
+                    <span class="theme-toggle-track" aria-hidden="true">
+                      <span class="theme-toggle-thumb"></span>
+                    </span>
+                  </span>
+                </button>
+                <p class="visually-hidden" id="theme-toggle-hint">Switches between light and dark color themes. Choice is saved in this browser.</p>
+              </div>
+            </div>
+
+            <div class="settings-group" aria-labelledby="skill-mode-controls-title">
+              <p class="settings-group-title" id="skill-mode-controls-title">Experience level</p>
+              <div class="settings-row settings-row--stack">
+                <p class="settings-row-sublabel">Detail on alerts and playbooks</p>
+                <button
+                  type="button"
+                  id="skillModeToggle"
+                  class="skill-mode-toggle skill-mode-toggle--settings"
+                  aria-describedby="skill-mode-hint"
+                  aria-label="Experience level: Standard. Tap to change."
+                >
+                  <span class="skill-mode-bars" aria-hidden="true">
+                    <span class="skill-mode-bar"></span>
+                    <span class="skill-mode-bar"></span>
+                    <span class="skill-mode-bar"></span>
+                  </span>
+                  <span class="skill-mode-level-label" id="skillModeLevelLabel">Standard</span>
+                </button>
+                <p class="settings-row-hint" id="skill-mode-hint">Saved in this browser.</p>
+              </div>
+            </div>
+
+            <div class="settings-group" id="motionSettingsGroup">
+              <p class="settings-group-title">Motion</p>
+              <div class="settings-row settings-row--slider">
+                <div class="settings-row-slider-head">
+                  <span class="settings-row-label">Animation speed</span>
+                  <span class="settings-row-value" id="motionSpeedLabel" aria-live="polite">Normal</span>
+                </div>
+                <input
+                  type="range"
+                  class="motion-speed-slider"
+                  id="motionSpeedSlider"
+                  min="0"
+                  max="200"
+                  step="5"
+                  value="100"
+                  aria-describedby="motionSpeedHint"
+                  aria-valuetext="Normal"
+                />
+                <p class="settings-row-hint" id="motionSpeedHint">Saved in this browser. System reduced-motion still applies.</p>
+              </div>
+            </div>
+
+            <div class="settings-group" id="fontSizeSettingsGroup">
+              <p class="settings-group-title">Text</p>
+              <div class="settings-row settings-row--slider">
+                <div class="settings-row-slider-head">
+                  <span class="settings-row-label">Font size</span>
+                  <span class="settings-row-value" id="fontSizeLabel" aria-live="polite">Medium</span>
+                </div>
+                <input
+                  type="range"
+                  class="motion-speed-slider font-size-slider"
+                  id="fontSizeSlider"
+                  min="0"
+                  max="100"
+                  step="50"
+                  value="50"
+                  aria-describedby="fontSizeHint"
+                  aria-valuetext="Medium"
+                />
+                <p class="settings-row-hint" id="fontSizeHint">Saved in this browser.</p>
+              </div>
+            </div>
+          </div>
         </section>
 
         <section class="page health-desk" id="health" aria-label="System health">
@@ -673,12 +849,19 @@
             </div>
           </dialog>
         </section>
+        </div>
       </main>
     </div>
 
     <!-- 1.15.8 is not served on jsDelivr (404); keep pinned loadable version for sidebar reorder. -->
     <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.7/Sortable.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="./modules/skill-mode.js"></script>
+    <script src="./modules/motion.js"></script>
+    <script src="./modules/font-size.js"></script>
+    <script src="./modules/narrative.js"></script>
+    <script src="./modules/scan-context.js"></script>
+    <script src="./modules/symbol-research-bridge.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

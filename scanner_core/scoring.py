@@ -1,7 +1,7 @@
 # scoring.py — 100-point confidence scoring: 5 categories × 20 points + news modifier
 
-import math
 import logging
+import math
 from typing import Optional
 import pandas as pd
 import pytz
@@ -22,6 +22,11 @@ from scanner_core.news import get_news_score_modifier
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone(MARKET_TIMEZONE)
+
+
+def _score_debug(msg: str, *args) -> None:
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(msg, *args)
 
 
 # ── Optional adaptive weight import (fails gracefully if not yet enough trades) ──
@@ -399,10 +404,11 @@ def calculate_full_score(ticker: str, indicators: dict, entry_price: float,
     # Adaptive weight adjustment (-5 to +10)
     adaptive_adj = _get_adaptive_adjustment(indicators, entry_price)
 
-    # Console debug output
-    print(f"  [SCORE] {ticker}: Trend={trend_s}/20 Mom={mom_s}/20 Vol={vol_s}/20 "
-          f"RS={rs_s}/20 Risk={risk_s}/20 Base={base_score}/100 "
-          f"Flow=+{flow_bonus} Adaptive={adaptive_adj:+d}")
+    _score_debug(
+        "  [SCORE] %s: Trend=%s/20 Mom=%s/20 Vol=%s/20 RS=%s/20 Risk=%s/20 "
+        "Base=%s/100 Flow=+%s Adaptive=%+d",
+        ticker, trend_s, mom_s, vol_s, rs_s, risk_s, base_score, flow_bonus, adaptive_adj,
+    )
 
     # News modifier
     news_result = get_news_score_modifier(ticker)
@@ -413,7 +419,7 @@ def calculate_full_score(ticker: str, indicators: dict, entry_price: float,
     total = max(0, min(100, base_score + news_mod + flow_bonus + adaptive_adj))
     flag = get_confidence_flag(total)
 
-    print(f"  [SCORE] {ticker}: News={news_mod:+d} Total={total}/100 Flag={flag}")
+    _score_debug("  [SCORE] %s: News=%+d Total=%s/100 Flag=%s", ticker, news_mod, total, flag)
 
     explanation = _generate_explanation(
         trend_s, trend_bd, mom_s, mom_bd, vol_s, vol_bd,
@@ -488,10 +494,10 @@ def calculate_afterhours_score(ticker: str, indicators: dict = None,
     Legacy closed-market entry point. Kept for compatibility, but disabled.
     Returns a neutral no-trade score.
     """
-    print(f"  [SCORE-CLOSED] {ticker}: closed-market scoring disabled")
+    _score_debug("  [SCORE-CLOSED] %s: closed-market scoring disabled", ticker)
     return closed_market_score(ticker)
 
-    print(f"  [SCORE-CLOSED] {ticker}: legacy closed-market scorer disabled")
+    _score_debug("  [SCORE-CLOSED] %s: legacy closed-market scorer disabled", ticker)
 
     score = 25  # Always start with base score of 25
     breakdown = {"trend": 5, "momentum": 5, "volume": 5,
@@ -637,7 +643,7 @@ def calculate_afterhours_score(ticker: str, indicators: dict = None,
                     pass
 
     except Exception as data_error:
-        print(f"  [SCORE-AH] {ticker}: Data fetch failed: {data_error}")
+        _score_debug("  [SCORE-AH] %s: Data fetch failed: %s", ticker, data_error)
         # Even if data fetch fails, return the base score of 25
 
     # Cap score — NEVER below 20
@@ -652,8 +658,8 @@ def calculate_afterhours_score(ticker: str, indicators: dict = None,
 
     flag = get_confidence_flag(score)
 
-    print(f"  [SCORE-CLOSED] {ticker}: closed-market score = {score}/100")
-    print(f"  [SCORE-AH] {ticker}: Breakdown = {breakdown}")
+    _score_debug("  [SCORE-CLOSED] %s: closed-market score = %s/100", ticker, score)
+    _score_debug("  [SCORE-AH] %s: Breakdown = %s", ticker, breakdown)
 
     return {
         "total": score,
@@ -774,8 +780,11 @@ def score_from_available_data(ticker: str, rsi=None, rvol=None,
 
     score = max(20, min(100, score))
 
-    print(f"  [SCORE-DIRECT] {ticker}: Direct indicator score = {score}/100")
-    print(f"  [SCORE-DIRECT] {ticker}: RSI={rsi} RVOL={rvol} VWAP%={vwap_pct} Change={price_change}%")
+    _score_debug("  [SCORE-DIRECT] %s: Direct indicator score = %s/100", ticker, score)
+    _score_debug(
+        "  [SCORE-DIRECT] %s: RSI=%s RVOL=%s VWAP%%=%s Change=%s%%",
+        ticker, rsi, rvol, vwap_pct, price_change,
+    )
 
     flag = get_confidence_flag(score)
 
@@ -829,9 +838,12 @@ def get_final_score(ticker: str, indicators: dict, entry_price: float = 0.0,
         )
         if result.get("total", 0) > 5:
             return result
-        print(f"  [SCORE] {ticker}: Normal scorer returned {result.get('total', 0)}, trying fallbacks")
+        _score_debug(
+            "  [SCORE] %s: Normal scorer returned %s, trying fallbacks",
+            ticker, result.get("total", 0),
+        )
     except Exception as e:
-        print(f"  [SCORE] {ticker}: Normal scorer crashed: {e}")
+        _score_debug("  [SCORE] %s: Normal scorer crashed: %s", ticker, e)
 
     try:
         # Priority 2: Try direct indicator scoring if we have indicator data
@@ -853,10 +865,10 @@ def get_final_score(ticker: str, indicators: dict, entry_price: float = 0.0,
             if result.get("total", 0) > 5:
                 return result
     except Exception as e:
-        print(f"  [SCORE] {ticker}: Direct scorer failed: {e}")
+        _score_debug("  [SCORE] %s: Direct scorer failed: %s", ticker, e)
 
     # Priority 4: Absolute last resort — never return 0
-    print(f"  [SCORE] {ticker}: All scorers failed, returning default 30")
+    _score_debug("  [SCORE] %s: All scorers failed, returning default 30", ticker)
     return {
         "total": 30,
         "trend": 6, "momentum": 6, "volume": 6, "rs": 6, "risk": 6,
@@ -1012,7 +1024,7 @@ def get_score(ticker: str, indicators: dict = None,
                 return score, result
 
     except Exception as e:
-        print(f"  [SCORE] {ticker}: get_score crashed: {e}")
+        _score_debug("  [SCORE] %s: get_score crashed: %s", ticker, e)
 
     # Priority 3: Hard-coded minimum
     fallback = {

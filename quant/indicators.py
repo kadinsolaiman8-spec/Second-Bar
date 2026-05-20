@@ -410,3 +410,219 @@ def get_latest_indicators(
                 pass
 
     return result
+
+
+def _prepare_ohlc(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Align OHLC series the same way as get_latest_indicators."""
+    close = df["Close"].dropna()
+    high = df["High"].reindex(close.index).ffill().bfill()
+    low = df["Low"].reindex(close.index).ffill().bfill()
+    return close, high, low
+
+
+def _mr_indicator_min_len(
+    rsi_period: int,
+    macd_slow: int,
+    bb_period: int,
+    supertrend_period: int,
+    stoch_window: int,
+    willr_period: int,
+    ema_slow: int,
+    atr_period: int,
+    atr_avg_period: int,
+) -> int:
+    return max(
+        rsi_period, macd_slow, bb_period, supertrend_period,
+        stoch_window, willr_period, ema_slow, atr_period + atr_avg_period,
+    ) + 15
+
+
+def precompute_indicators(
+    df: pd.DataFrame,
+    rsi_period: int = 14,
+    macd_fast: int = 12,
+    macd_slow: int = 26,
+    macd_signal: int = 9,
+    bb_period: int = 20,
+    bb_std: float = 2.0,
+    supertrend_period: int = 10,
+    supertrend_multiplier: float = 3.0,
+    stoch_window: int = 14,
+    stoch_smooth: int = 3,
+    willr_period: int = 14,
+    ema_fast: int = 9,
+    ema_slow: int = 21,
+    atr_period: int = 14,
+    atr_avg_period: int = 20,
+) -> dict | None:
+    """
+    Precompute mean-reversion indicator arrays aligned to df rows.
+    Value at index i matches get_latest_indicators(df.iloc[: i + 1]).
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    if "High" not in df.columns or "Low" not in df.columns:
+        return None
+
+    close, high, low = _prepare_ohlc(df)
+    min_len = _mr_indicator_min_len(
+        rsi_period, macd_slow, bb_period, supertrend_period,
+        stoch_window, willr_period, ema_slow, atr_period, atr_avg_period,
+    )
+    if len(close) < min_len:
+        return None
+
+    rsi_series = compute_rsi(close, period=rsi_period)
+    _, _, macd_hist = compute_macd(close, macd_slow, macd_fast, macd_signal)
+    bb_upper, bb_mid, bb_lower = compute_bollinger(close, bb_period, bb_std)
+    st_series, st_direction = compute_supertrend(
+        high, low, close, period=supertrend_period, multiplier=supertrend_multiplier,
+    )
+    stoch_k, stoch_d = compute_stochastic(
+        high, low, close, window=stoch_window, smooth_window=stoch_smooth,
+    )
+    willr_series = compute_williams_r(high, low, close, lbp=willr_period)
+    ema_fast_series, ema_slow_series, ema_bullish_series = compute_ema_crossover(
+        close, fast=ema_fast, slow=ema_slow,
+    )
+    atr_series = compute_atr(high, low, close, window=atr_period)
+    atr_pct_series = compute_atr_pct(close, atr_series)
+    atr_pct_avg = atr_pct_series.rolling(window=atr_avg_period, min_periods=1).mean()
+    atr_pct_vs_avg_series = atr_pct_series - atr_pct_avg
+    sma_200_series = compute_sma_200(close)
+
+    idx = df.index
+    close_arr = close.reindex(idx).to_numpy(dtype=float, copy=False)
+    series_map = {
+        "rsi": rsi_series,
+        "macd_hist": macd_hist,
+        "bb_upper": bb_upper,
+        "bb_middle": bb_mid,
+        "bb_lower": bb_lower,
+        "supertrend_value": st_series,
+        "supertrend_direction": st_direction,
+        "stoch_k": stoch_k,
+        "stoch_d": stoch_d,
+        "williams_r": willr_series,
+        "ema_fast": ema_fast_series,
+        "ema_slow": ema_slow_series,
+        "ema_bullish": ema_bullish_series,
+        "atr": atr_series,
+        "atr_pct": atr_pct_series,
+        "atr_pct_vs_avg": atr_pct_vs_avg_series,
+        "sma_200": sma_200_series,
+    }
+    arrays: dict[str, np.ndarray | None] = {"close": close_arr}
+    for key, ser in series_map.items():
+        arrays[key] = ser.reindex(idx).to_numpy(copy=False)
+
+    has_volume = False
+    if "Volume" in df.columns:
+        volume = df["Volume"].reindex(close.index).fillna(0)
+        if volume.sum() > 0:
+            has_volume = True
+            try:
+                arrays["vwap_deviation"] = compute_vwap_deviation(
+                    high, low, close, volume,
+                ).reindex(idx).to_numpy(copy=False)
+            except Exception:
+                arrays["vwap_deviation"] = None
+            try:
+                arrays["obv_divergence"] = compute_obv_divergence(
+                    close, volume,
+                ).reindex(idx).to_numpy(copy=False)
+            except Exception:
+                arrays["obv_divergence"] = None
+            try:
+                arrays["cmf"] = compute_cmf(
+                    high, low, close, volume,
+                ).reindex(idx).to_numpy(copy=False)
+            except Exception:
+                arrays["cmf"] = None
+
+    if not has_volume:
+        arrays["vwap_deviation"] = None
+        arrays["obv_divergence"] = None
+        arrays["cmf"] = None
+
+    return {
+        "arrays": arrays,
+        "min_len": min_len,
+        "n": len(df),
+    }
+
+
+def _valid_close_count(close_arr: np.ndarray, i: int) -> int:
+    if i < 0:
+        return 0
+    segment = close_arr[: i + 1]
+    return int(np.sum(np.isfinite(segment)))
+
+
+def indicators_at(i: int, precomp: dict) -> dict[str, float] | None:
+    """Return indicator dict at bar index i (same shape as get_latest_indicators)."""
+    if i < 0 or i >= precomp["n"]:
+        return None
+
+    arrays = precomp["arrays"]
+    close_arr = arrays["close"]
+    if _valid_close_count(close_arr, i) < precomp["min_len"]:
+        return None
+
+    close_val = float(close_arr[i])
+    if not np.isfinite(close_val):
+        return None
+
+    def _f(key: str) -> float:
+        arr = arrays[key]
+        val = arr[i]
+        return float(val) if np.isfinite(val) else float("nan")
+
+    st_dir_arr = arrays["supertrend_direction"]
+    st_dir = int(st_dir_arr[i]) if np.isfinite(st_dir_arr[i]) else 0
+    ema_bull_arr = arrays["ema_bullish"]
+    ema_bullish_val = int(ema_bull_arr[i]) if np.isfinite(ema_bull_arr[i]) else 0
+
+    sma_200_val = arrays["sma_200"][i]
+    sma_200_float = float(sma_200_val) if np.isfinite(sma_200_val) else float("nan")
+
+    result: dict[str, float | int | None] = {
+        "rsi": _f("rsi"),
+        "macd_hist": _f("macd_hist"),
+        "bb_upper": _f("bb_upper"),
+        "bb_middle": _f("bb_middle"),
+        "bb_lower": _f("bb_lower"),
+        "close": close_val,
+        "supertrend_value": _f("supertrend_value"),
+        "supertrend_direction": st_dir,
+        "stoch_k": _f("stoch_k"),
+        "stoch_d": _f("stoch_d"),
+        "williams_r": _f("williams_r"),
+        "ema_fast": _f("ema_fast"),
+        "ema_slow": _f("ema_slow"),
+        "ema_bullish": ema_bullish_val,
+        "atr": _f("atr"),
+        "atr_pct": _f("atr_pct"),
+        "atr_pct_vs_avg": _f("atr_pct_vs_avg"),
+        "sma_200": sma_200_float,
+        "vwap_deviation": None,
+        "obv_divergence": None,
+        "cmf": None,
+    }
+
+    vwap_arr = arrays.get("vwap_deviation")
+    if vwap_arr is not None:
+        v = vwap_arr[i]
+        result["vwap_deviation"] = float(v) if np.isfinite(v) else None
+
+    obv_arr = arrays.get("obv_divergence")
+    if obv_arr is not None:
+        v = obv_arr[i]
+        result["obv_divergence"] = int(v) if np.isfinite(v) else None
+
+    cmf_arr = arrays.get("cmf")
+    if cmf_arr is not None:
+        v = cmf_arr[i]
+        result["cmf"] = float(v) if np.isfinite(v) else None
+
+    return result  # type: ignore[return-value]

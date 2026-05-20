@@ -42,7 +42,11 @@ from backend.realtime import (  # noqa: E402
     register_sse_subscriber,
     unregister_sse_subscriber,
 )
-from backend.scan_bundle import build_latest_scan_bundle  # noqa: E402
+from backend.market_session import build_market_session  # noqa: E402
+from backend.scan_bundle import (  # noqa: E402
+    build_latest_scan_bundle,
+    enrich_ticker_detail_state,
+)
 from backend.scan_publish import finalize_scan_publish_async  # noqa: E402
 from backend.scheduler import build_scheduler, run_daily_reset, run_scheduled_scan  # noqa: E402
 from quant.backtest import BacktestResult, run_backtest  # noqa: E402
@@ -260,6 +264,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/market/session")
+def market_session() -> dict:
+    return build_market_session()
 
 
 @app.get("/api/health")
@@ -582,12 +591,19 @@ def scan_ticker_detail(symbol: str) -> dict:
         break
     snap = state.snapshot()
     market_code = get_current_market_state()
+    market_state_blob = {"code": market_code, "label": get_state_label(market_code)}
     context = {
         "last_scan_at": snap.get("last_scan_at"),
         "last_error": snap.get("last_error"),
-        "market_state": {"code": market_code, "label": get_state_label(market_code)},
+        "market_state": market_state_blob,
         "regime": scanner_mod.get_current_regime(),
     }
+    merged_state = enrich_ticker_detail_state(
+        merged_state,
+        symbol_upper,
+        snap.get("signals") or [],
+        market_state_blob,
+    )
     return {
         "ticker": symbol_upper,
         "state": state.json_safe(merged_state),

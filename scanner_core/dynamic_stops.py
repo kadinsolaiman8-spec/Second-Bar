@@ -133,6 +133,71 @@ def calculate_dynamic_stop(ticker: str, entry_price: float,
     }
 
 
+def snapshot_pct_trailing_stop(
+    price: float,
+    direction: str,
+    trailing_stop_pct: float,
+    *,
+    peak_price: float | None = None,
+) -> float | None:
+    """
+    Informational stop from % retracement off peak (parity with backtest when ATR trail is off).
+    Uses ``price`` as peak when ``peak_price`` is omitted (signal-time snapshot).
+    """
+    price = _safe_float(price, 0.0)
+    trailing_stop_pct = _safe_float(trailing_stop_pct, 0.0)
+    if price <= 0 or trailing_stop_pct <= 0:
+        return None
+    peak = _safe_float(peak_price if peak_price is not None else price, price)
+    if peak <= 0:
+        return None
+    direction_norm = str(direction or "BUY").upper()
+    if direction_norm in ("SELL", "SHORT"):
+        return round(peak * (1 + trailing_stop_pct / 100), 2)
+    return round(peak * (1 - trailing_stop_pct / 100), 2)
+
+
+def _load_backtest_config() -> dict:
+    """Read ``backtest`` section from repo ``config.yaml`` when present."""
+    try:
+        from pathlib import Path
+
+        import yaml
+
+        config_path = Path(__file__).resolve().parents[1] / "config.yaml"
+        if not config_path.exists():
+            return {}
+        with open(config_path, encoding="utf-8") as handle:
+            root = yaml.safe_load(handle) or {}
+        bt = root.get("backtest") if isinstance(root, dict) else None
+        return bt if isinstance(bt, dict) else {}
+    except Exception:
+        return {}
+
+
+def apply_backtest_trailing_stop_overlay(
+    entry_price: float,
+    direction: str,
+    stop: float,
+    stop_type: str,
+    *,
+    backtest: dict | None = None,
+) -> tuple[float, str]:
+    """
+    When ``trailing_stop_pct`` is set and ATR trail multiplier is off, expose % trail stop
+    on live snapshots (matches backtest retracement rule at signal time).
+    """
+    bt = backtest if backtest is not None else _load_backtest_config()
+    trailing_pct = _safe_float(bt.get("trailing_stop_pct"), 0.0)
+    trailing_atr_mult = _safe_float(bt.get("trailing_stop_atr_multiplier"), 0.0)
+    if trailing_pct <= 0 or trailing_atr_mult > 0:
+        return stop, stop_type
+    snap = snapshot_pct_trailing_stop(entry_price, direction, trailing_pct)
+    if snap is None:
+        return stop, stop_type
+    return snap, f"Trailing {trailing_pct:g}% (snapshot)"
+
+
 def _fallback_stops(entry_price: float, atr: float) -> dict:
     """Minimal safe fallback when entry_price is 0."""
     return {

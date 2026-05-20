@@ -43,6 +43,13 @@ const state = {
   stockTicker: null,
 };
 
+/** Market session from GET /api/market/session; falls back to simplified Mon–Fri hours. */
+let marketSessionState = {
+  loaded: false,
+  data: null,
+  simplified: false,
+};
+
 /** Set by refreshFromBackend(): health + scan + journal payloads from FastAPI */
 let backendHealth = {
   loaded: false,
@@ -67,8 +74,54 @@ let scannerSseStreaming = false;
 
 const POLL_INTERVAL_MS = 30000;
 const POLL_SLOW_MS_WHEN_SSE = 120000;
+/** Trailing debounce for scan/snapshot SSE → DOM (latest payload wins). */
+const SCANNER_LIVE_DOM_COALESCE_MS = 150;
 
 let scannerLiveEventSource = null;
+/** Latest scan payload waiting for coalesced DOM flush. */
+let scannerLiveDomPending = null;
+let scannerLiveDomTimerId = null;
+
+function motionDisabled() {
+  const motion = globalThis.TbMotion;
+  if (motion?.getScale) return motion.getScale() === 0;
+  try {
+    return (
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    );
+  } catch {
+    return false;
+  }
+}
+
+function motionDurationMs(baseMs) {
+  const motion = globalThis.TbMotion;
+  if (motion?.durationMs) return motion.durationMs(baseMs);
+  return baseMs;
+}
+
+/** Keeps CSS `dot--click-spin` duration and JS cleanup in sync (12% of the 10s idle cycle). */
+const SIDE_NOTE_DOT_CLICK_SPIN_MS = 1200;
+
+let sideNoteDotSpinClearTimerId = null;
+
+function playSideNoteDotClickSpin(buttonEl) {
+  if (motionDisabled()) return;
+  const dot = buttonEl?.querySelector?.(".dot");
+  if (!dot) return;
+  if (sideNoteDotSpinClearTimerId != null) {
+    window.clearTimeout(sideNoteDotSpinClearTimerId);
+    sideNoteDotSpinClearTimerId = null;
+  }
+  dot.classList.remove("dot--click-spin");
+  void dot.offsetWidth;
+  dot.classList.add("dot--click-spin");
+  sideNoteDotSpinClearTimerId = window.setTimeout(() => {
+    dot.classList.remove("dot--click-spin");
+    sideNoteDotSpinClearTimerId = null;
+  }, motionDurationMs(SIDE_NOTE_DOT_CLICK_SPIN_MS) || SIDE_NOTE_DOT_CLICK_SPIN_MS);
+}
 
 /** Web Animations rotation for #refreshStatus icon (CSS keyframes on SVG are unreliable). */
 let refreshStatusSpinAnimation = null;
@@ -76,10 +129,7 @@ let refreshStatusSpinAnimation = null;
 function playRefreshStatusIconSpin(buttonEl) {
   const svg = buttonEl?.querySelector?.("svg");
   if (!buttonEl || typeof buttonEl.animate !== "function") return;
-  if (
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  ) {
+  if (motionDisabled()) {
     return;
   }
   try {
@@ -89,7 +139,7 @@ function playRefreshStatusIconSpin(buttonEl) {
   }
   const keyframes = [{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }];
   const timing = {
-    duration: 650,
+    duration: motionDurationMs(650) || 650,
     easing: "cubic-bezier(0.45, 0.05, 0.25, 1)",
     fill: "none",
   };
@@ -126,7 +176,7 @@ let stockChartVisibleRangeHandler = null;
 let stockHistoryInfoDocHandlersBound = false;
 
 const NAV_ORDER_STORAGE_KEY = "tb_sidebar_nav_order_v1";
-const SIDEBAR_REORDERABLE_IDS = ["journal", "backtest"];
+const SIDEBAR_REORDERABLE_IDS = ["journal", "backtest", "settings"];
 const SIDEBAR_NAV_DEFAULT_ORDER = [...SIDEBAR_REORDERABLE_IDS];
 
 /** SortableJS instance for draggable sidebar tabs (excluding Home). */
@@ -393,11 +443,7 @@ function btTickerTypewriterShouldRun() {
   if (!detail || detail.classList.contains("bt-run-panel-detail--collapsed")) return false;
   if (normalizeBtTicker(input.value) !== "") return false;
   if (document.activeElement === input) return false;
-  try {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return false;
-  } catch {
-    /* ignore */
-  }
+  if (motionDisabled()) return false;
   return true;
 }
 
@@ -484,11 +530,7 @@ function homeWatchlistTypewriterShouldRun() {
   if (state.page !== "live") return false;
   if (String(input.value).trim() !== "") return false;
   if (document.activeElement === input) return false;
-  try {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return false;
-  } catch {
-    /* ignore */
-  }
+  if (motionDisabled()) return false;
   return true;
 }
 
@@ -669,6 +711,10 @@ function syncMainTopHeader() {
     eyebrow.textContent = "Second Bar · Journal";
     title.textContent = "Paper journal · Today";
     document.title = "Second Bar · Journal";
+  } else if (state.page === "settings") {
+    eyebrow.textContent = "Second Bar · Settings";
+    title.textContent = "Preferences";
+    document.title = "Second Bar · Settings";
   } else if (state.page === "symbol") {
     const tickerDisplay = normalizeHomeTickerToken(state.stockTicker || "") || "—";
     eyebrow.textContent = "Second Bar · Chart";
@@ -684,7 +730,7 @@ function syncMainTopHeader() {
     topBar.classList.toggle("top--health-spread", state.page === "health");
   }
   if (pill) {
-    pill.hidden = state.page === "health";
+    pill.hidden = state.page === "health" || state.page === "settings";
   }
   if (refreshBtn) {
     refreshBtn.hidden = state.page !== "health";
@@ -807,7 +853,13 @@ function wireBtHistoryListInteractivity(root) {
         btRunPanelDetailOpen = false;
       }
       location.hash = "#backtest/result";
-      renderBacktestResults(found.snapshot);
+      const histSym = normalizeBtTicker(found.snapshot?.ticker || found.snapshot?.result?.symbol || "");
+      if (histSym) {
+        const ti = q("#btTicker");
+        if (ti) ti.value = histSym;
+      }
+      void renderBacktestResults(found.snapshot);
+      void refreshWfoValidationPanel();
       syncBacktestRouteUi();
     });
   });
@@ -991,6 +1043,18 @@ function navigateBacktestHistoryHash() {
   location.hash = "#backtest/history";
 }
 
+function applyBacktestSymbolPrefillFromBridge() {
+  const bridge = globalThis.TbSymbolResearchBridge;
+  if (!bridge?.prefillBacktestTickerFromHash) return;
+  const sym = bridge.prefillBacktestTickerFromHash();
+  if (!sym) return;
+  loadBtSettingsForTickerKey(sym);
+  clearBtTickerTypewriter();
+  refreshBtQuickCardSummary();
+  btRunPanelDetailOpen = true;
+  updateBtRunPanelLayout();
+}
+
 function normalizeAppHash() {
   return (location.hash || "").replace(/^#\/?/, "");
 }
@@ -1008,7 +1072,7 @@ function landingPageFromHash() {
     const parsedTicker = normalizeHomeTickerToken(stockRouteMatch[1]);
     const watchlistMembership = readHomeWatchlistTickers();
     if (!parsedTicker || !watchlistMembership.includes(parsedTicker)) {
-      if (location.hash !== "#home") location.hash = "#home";
+      if (location.hash !== "#home") setAppHash("#home");
       return;
     }
     setPage("symbol", { fromHash: true, tickerSym: parsedTicker });
@@ -1018,8 +1082,12 @@ function landingPageFromHash() {
     setPage("journal", { fromHash: true });
     return;
   }
-  if (h === "backtest" || h.startsWith("backtest/")) {
+  if (h === "backtest" || h.startsWith("backtest")) {
     setPage("backtest", { fromHash: true });
+    return;
+  }
+  if (h === "settings") {
+    setPage("settings", { fromHash: true });
     return;
   }
   if (h === "health") {
@@ -1041,25 +1109,43 @@ function landingPageFromHash() {
   setPage("live", { fromHash: true });
 }
 
+function setAppHash(hash) {
+  const next = String(hash || "").startsWith("#") ? String(hash) : `#${hash}`;
+  if (location.hash === next) return;
+  history.replaceState(null, "", `${location.pathname}${location.search}${next}`);
+}
+
+function resetAppScrollPosition() {
+  try {
+    window.scrollTo(0, 0);
+  } catch {
+    /* ignore */
+  }
+}
+
 function syncHashToPage(page, fromHash) {
   if (fromHash) return;
   if (page === "backtest") {
-    if (location.hash !== "#backtest" && !String(location.hash).startsWith("#backtest/")) {
-      location.hash = "#backtest";
+    if (!String(location.hash).includes("?") && location.hash !== "#backtest" && !String(location.hash).startsWith("#backtest/")) {
+      setAppHash("#backtest");
     }
     return;
   }
   if (page === "journal") {
-    if (location.hash !== "#journal") location.hash = "#journal";
+    if (location.hash !== "#journal") setAppHash("#journal");
+    return;
+  }
+  if (page === "settings") {
+    if (location.hash !== "#settings") setAppHash("#settings");
     return;
   }
   if (page === "symbol") {
     const tk = normalizeHomeTickerToken(state.stockTicker || "");
-    if (tk && location.hash !== `#stock/${tk}`) location.hash = `#stock/${tk}`;
+    if (tk && location.hash !== `#stock/${tk}`) setAppHash(`#stock/${tk}`);
     return;
   }
   const wantHash = page === "health" ? "#health" : "#home";
-  if (location.hash !== wantHash) location.hash = wantHash;
+  if (location.hash !== wantHash) setAppHash(wantHash);
 }
 
 let dayStrategiesList = [];
@@ -1178,88 +1264,70 @@ function updateQuantStrategyWfoFootnote() {
   note.textContent = "";
 }
 
+let researchBridgeModulePromise = null;
+
+function loadResearchBridgeModule() {
+  if (!researchBridgeModulePromise) {
+    researchBridgeModulePromise = import("./modules/research-bridge.js");
+  }
+  return researchBridgeModulePromise;
+}
+
+let backtestChartModulePromise = null;
+
+function loadBacktestChartModule() {
+  if (!backtestChartModulePromise) {
+    backtestChartModulePromise = import("./modules/backtest-chart.js");
+  }
+  return backtestChartModulePromise;
+}
+
 async function refreshWfoValidationPanel() {
-  const emptyEl = q("#btWfoEmpty");
-  if (!emptyEl) return;
-  const dlEl = q("#btWfoSummaryDl");
-  const rawEl = q("#btWfoJsonPre");
-  const rawWrap = q("#btWfoRawWrap");
-  if (!emptyEl || !dlEl || !rawEl || !rawWrap) return;
-  dlEl.hidden = true;
-  rawWrap.hidden = true;
-  dlEl.innerHTML = "";
-  rawEl.textContent = "";
+  const bridge = await loadResearchBridgeModule();
+  bridge.ensureWfoPanelMounted();
   try {
     const res = await fetch("/api/quant/wfo/latest");
     if (!res.ok) throw new Error("latest");
     const body = await res.json();
     const list = Array.isArray(body.results) ? body.results : [];
     if (!list.length) {
-      emptyEl.hidden = false;
-      emptyEl.textContent =
-        "No imported batch results yet. Place a validation export in this dashboard’s data folder, then refresh.";
+      bridge.setWfoPanelEmpty(
+        document,
+        "No validation exports found yet. Add a walk-forward JSON export to your data folder, then reopen this tab.",
+      );
       return;
     }
-    emptyEl.hidden = true;
     const top = list[0];
     const slug = top && top.slug ? String(top.slug) : "";
-    if (!slug) return;
+    if (!slug) {
+      bridge.setWfoPanelEmpty(document, "Latest validation entry is missing an id.");
+      return;
+    }
     const detailRes = await fetch(`/api/quant/wfo/results/${encodeURIComponent(slug)}`);
     if (!detailRes.ok) {
-      emptyEl.hidden = false;
-      emptyEl.textContent = "Could not load the latest saved validation run.";
+      bridge.setWfoPanelEmpty(document, "Could not load the latest saved validation run.");
       return;
     }
     const wrapped = await detailRes.json().catch(() => ({}));
-    const d = wrapped && typeof wrapped.data === "object" ? wrapped.data : {};
-    function row(label, val) {
-      let vDisp = "—";
-      if (val != null && val !== "") {
-        if (typeof val === "number" && Number.isFinite(val)) {
-          vDisp = String(val);
-        } else if (typeof val !== "number") {
-          vDisp = escapeHtml(String(val));
-        }
-      }
-      return `<div class="bt-wfo-dt">${escapeHtml(label)}</div><div class="bt-wfo-dd">${vDisp}</div>`;
-    }
-    dlEl.innerHTML = [
-      row("Symbol", d.ticker),
-      row("Engine preset", d.strategy),
-      row("Optimized for", d.optimize_metric),
-      row("Fold count", d.n_folds),
-      row("Sharpe headline (combined OOS bars)", d.oos_sharpe_headline),
-      row("Bootstrap p-value", d.stationary_bootstrap_pvalue),
-      row("Exported at", d.timestamp_iso || top.ts || ""),
-      row("Saved id", slug),
-    ].join("");
-    dlEl.hidden = false;
-    try {
-      rawEl.textContent = JSON.stringify(wrapped.data, null, 2);
-      rawWrap.hidden = false;
-    } catch {
-      rawWrap.hidden = true;
-    }
+    const btSymbol = normalizeBtTicker(q("#btTicker")?.value ?? "");
+    bridge.populateWfoPanel(document, wrapped, {
+      slug,
+      ts: top.ts,
+      symbol: btSymbol || undefined,
+      scanPayload: backendHealth.scan,
+    });
   } catch {
-    emptyEl.hidden = false;
-    emptyEl.textContent = "Validation summary is unavailable.";
+    bridge.setWfoPanelEmpty(document, "Validation summary is unavailable. Start the server and try again.");
   }
 }
 
 /**
  * ---------------------------------------------------------------------------
- * US equity regular session (HARDCODED mock for the Home market clock)
+ * US equity regular session (Home market clock)
  * ---------------------------------------------------------------------------
- * Mon–Fri, 09:30–16:00 America/New_York, minute granularity. Weekends = closed.
- *
- * TODO production:
- *   - NYSE / Nasdaq holiday calendars + early closes (ICS, Polygon marketstatus,
- *     Alpaca calendar, etc.).
- *   - Align “next open” with your data vendor’s actual tape hours if you trade
- *     extended hours later.
- *
- * Day-trading rule parity lives in quant/intraday_backtest_strategies.py
- * (DAY_TRADING_STRATEGY_LABELS / ALLOWED_DAY_STRATEGY_IDS).
+ * Primary source: GET /api/market/session (NYSE calendar via backend).
+ * Fallback: Mon–Fri 09:30–16:00 America/New_York with banner
+ * "Using simplified hours" when the API is unavailable.
  * ---------------------------------------------------------------------------
  */
 const MOCK_DAY_TRADE_LIQUID_UNIVERSE = [
@@ -1452,7 +1520,7 @@ function writeHomeWatchlistTickers(tickers) {
 const WATCHLIST_CARD_RED_FLASH_MS = Math.round(680 * 0.8);
 
 function pulseWatchlistCardRedFlash() {
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  if (motionDisabled()) return;
   const bar = q(".home-watchlist-bar");
   if (!bar) return;
   if (watchlistCardRedFlashClearTimerId != null) {
@@ -1465,7 +1533,7 @@ function pulseWatchlistCardRedFlash() {
   watchlistCardRedFlashClearTimerId = window.setTimeout(() => {
     bar.classList.remove("watchlist-card-red-flash");
     watchlistCardRedFlashClearTimerId = null;
-  }, WATCHLIST_CARD_RED_FLASH_MS);
+  }, motionDurationMs(WATCHLIST_CARD_RED_FLASH_MS) || WATCHLIST_CARD_RED_FLASH_MS);
 }
 
 function scannerTableRowAttrs(sym, slideInTickers, watchlistedSet) {
@@ -1538,7 +1606,10 @@ function formatScannerStrategyHtml(sig) {
   return labelExtra ? `${code} · ${escapeHtml(labelExtra)}` : code;
 }
 
-function mergeScannerLivePayload(dataPayload) {
+function flushScannerLiveDomFromPending() {
+  scannerLiveDomTimerId = null;
+  const dataPayload = scannerLiveDomPending;
+  scannerLiveDomPending = null;
   if (!dataPayload || typeof dataPayload !== "object") return;
   hideHomeScanProgressStrip();
   backendHealth.loaded = true;
@@ -1546,6 +1617,22 @@ function mergeScannerLivePayload(dataPayload) {
   renderMarket();
   renderHomeDashboardPanels();
   renderHomeScanner();
+}
+
+function scheduleScannerLiveDomFlush() {
+  if (scannerLiveDomTimerId != null) {
+    window.clearTimeout(scannerLiveDomTimerId);
+  }
+  scannerLiveDomTimerId = window.setTimeout(
+    flushScannerLiveDomFromPending,
+    SCANNER_LIVE_DOM_COALESCE_MS,
+  );
+}
+
+function mergeScannerLivePayload(dataPayload) {
+  if (!dataPayload || typeof dataPayload !== "object") return;
+  scannerLiveDomPending = dataPayload;
+  scheduleScannerLiveDomFlush();
 }
 
 function dashboardDashListItems(rowsArr, formatter) {
@@ -1566,12 +1653,17 @@ function renderHomeDashboardPanels() {
   if (!backendHealth.loaded || !sp || typeof sp !== "object") {
     const msg = backendHealth.loaded
       ? "Run a scan to populate breadth and movers."
-      : "Connect to the backend for breadth and movers.";
+      : "Breadth and movers appear after the server connects.";
     breadthEl.innerHTML = `<p class="scanner-feed-empty">${escapeHtml(msg)}</p>`;
     if (moversEl) moversEl.innerHTML = "";
     if (suggestedBody) {
-      suggestedBody.innerHTML = `<p class="scanner-feed-empty">${escapeHtml("Run a scan to see suggested trades.")}</p>`;
+      suggestedBody.innerHTML = `<p class="scanner-feed-empty">${escapeHtml(
+        backendHealth.loaded
+          ? "Run a scan to surface ideas worth a closer look."
+          : "Suggested trades load after the server connects.",
+      )}</p>`;
     }
+    globalThis.TbScanContext?.renderPanels?.(null, { loaded: backendHealth.loaded });
     return;
   }
 
@@ -1592,9 +1684,11 @@ function renderHomeDashboardPanels() {
   `;
 
   if (moversEl) {
-    moversEl.innerHTML = dashboardDashListItems(sp.movers, (mRow) =>
-      `<li><span><b>${escapeHtml(String(mRow.ticker ?? ""))}</b></span><span>${escapeHtml(formatPct(mRow.change_pct))} · score ${escapeHtml(String(mRow.score ?? "—"))}</span></li>`,
-    );
+    moversEl.innerHTML = dashboardDashListItems(sp.movers, (mRow) => {
+      const sym = normalizeHomeTickerToken(mRow.ticker);
+      const chip = sym ? tickerChipHtml(sym) : escapeHtml(String(mRow.ticker ?? ""));
+      return `<li><span>${chip}</span>${moverBioHtml(mRow)}</li>`;
+    });
   }
 
   if (suggestedBody) {
@@ -1607,7 +1701,9 @@ function renderHomeDashboardPanels() {
     });
     const trades = fromSrv.length ? fromSrv.slice(0, 8) : fallbackTrades.slice(0, 8);
     if (!trades.length) {
-      suggestedBody.innerHTML = `<p class="scanner-feed-empty">${escapeHtml("No standout setups yet in this snapshot.")}</p>`;
+      suggestedBody.innerHTML = `<p class="scanner-feed-empty">${escapeHtml(
+        "No standout setups in this snapshot yet—check back after the next scan.",
+      )}</p>`;
     } else {
       suggestedBody.innerHTML = trades
         .map((row) => {
@@ -1618,28 +1714,33 @@ function renderHomeDashboardPanels() {
           const stratHtml = formatScannerStrategyHtml({ strategy: row.strategy });
           const dir = row.direction != null ? String(row.direction).trim() : "";
           const ch = formatPct(row.change_pct);
-          const ent = formatSuggestedTradePrice(row.entry_price);
-          const stp = formatSuggestedTradePrice(row.stop);
-          const tp = formatSuggestedTradePrice(row.tp1);
-          const bits = [];
-          if (ent != null) bits.push(`Entry ${ent}`);
-          if (stp != null) bits.push(`Stop ${stp}`);
-          if (tp != null) bits.push(`T1 ${tp}`);
-          const levelsHtml =
-            bits.length > 0 ? escapeHtml(bits.join(" · ")) : escapeHtml("Levels fill in on the next pass.");
+          const narrativeHtml = globalThis.TbNarrative?.suggestedCardInnerHtml?.(row, sp) ?? "";
+          const narrativeWideHtml = globalThis.TbNarrative?.suggestedCardInnerHtmlWide?.(row, sp) ?? "";
           const subLine = dir ? `${ch} · ${dir}` : ch;
-          return `<article class="suggested-trade-card">
-            <div class="suggested-trade-card-head"><b>${escapeHtml(sym)}</b><span class="suggested-trade-score">${escapeHtml(String(scoreV))}/100</span></div>
+          const wideSubLine = suggestedTradeWideSubLine(row);
+          const historyCta = globalThis.TbSymbolResearchBridge?.checkHistoryCtaHtml?.(sym, "check-history-cta--suggested") ?? "";
+          const compactBio = narrativeHtml
+            ? `<div class="dash-bio dash-bio--compact">${narrativeHtml}</div>`
+            : `<p class="suggested-trade-notes muted dash-bio dash-bio--compact">${escapeHtml(subLine)}</p>`;
+          const wideBio = narrativeWideHtml
+            ? `<div class="dash-bio dash-bio--wide">${narrativeWideHtml}</div>`
+            : `<p class="suggested-trade-notes muted dash-bio dash-bio--wide">${escapeHtml(wideSubLine)}</p>`;
+          return `<article class="suggested-trade-card suggested-trade-card--has-clickable-ticker">
+            <div class="suggested-trade-card-head">${tickerChipHtml(sym)}<span class="suggested-trade-score">${escapeHtml(String(scoreV))}/100</span></div>
             <div class="suggested-trade-strat">${stratHtml}</div>
-            <p class="suggested-trade-levels">${levelsHtml}</p>
-            <p class="suggested-trade-notes muted">${escapeHtml(subLine)}</p>
-            <button type="button" class="button secondary suggested-trade-add" data-suggested-add="${escapeHtml(sym)}" ${onWl ? "disabled" : ""}>${escapeHtml(onWl ? "On your list" : "Add to watchlist")}</button>
+            ${compactBio}
+            ${wideBio}
+            <div class="suggested-trade-actions">${historyCta}<button type="button" class="button secondary suggested-trade-add" data-suggested-add="${escapeHtml(sym)}" ${onWl ? "disabled" : ""}>${escapeHtml(onWl ? "On your list" : "Add to watchlist")}</button></div>
           </article>`;
         })
         .filter(Boolean)
         .join("");
+      globalThis.TbSkillMode?.applySkillMode?.(suggestedBody);
+      globalThis.TbSymbolResearchBridge?.wireCheckHistoryButtons?.(suggestedBody);
     }
   }
+
+  globalThis.TbScanContext?.renderPanels?.(sp, { loaded: true });
 }
 
 function renderJournalAside() {
@@ -1904,6 +2005,131 @@ function navigateToStockTicker(rawSym) {
   if (!tkNorm || !readHomeWatchlistTickers().includes(tkNorm)) return;
   lastSelectedScannerTicker = tkNorm;
   location.hash = `#stock/${tkNorm}`;
+}
+
+function tickerChipHtml(sym, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const safe = escapeHtml(sym);
+  const symbolInner = `<span class="ticker-chip-dollar" aria-hidden="true">$</span><b>${safe}</b>`;
+  if (opts.clickable === false) {
+    return `<span class="ticker-chip"><b>${safe}</b></span>`;
+  }
+  return `<span class="ticker-chip ticker-chip--clickable" data-ticker="${safe}" tabindex="0" role="button">${symbolInner}</span>`;
+}
+
+const LAYOUT_HORIZONTAL_MQL = "(orientation: landscape) and (min-width: 720px)";
+const LAYOUT_WIDE_DELAY_MS = 4000;
+
+let layoutHorizontalActive = false;
+let layoutWideReady = false;
+let layoutWideDelayTimerId = null;
+
+function isLayoutHorizontal() {
+  try {
+    return window.matchMedia(LAYOUT_HORIZONTAL_MQL).matches;
+  } catch {
+    return false;
+  }
+}
+
+function applyLayoutWideDomState() {
+  const horizontal = isLayoutHorizontal();
+  try {
+    document.documentElement.setAttribute("data-layout-horizontal", horizontal ? "1" : "0");
+    document.documentElement.setAttribute(
+      "data-layout-wide-ready",
+      horizontal && layoutWideReady ? "1" : "0",
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearLayoutWideDelayTimer() {
+  if (layoutWideDelayTimerId != null) {
+    window.clearTimeout(layoutWideDelayTimerId);
+    layoutWideDelayTimerId = null;
+  }
+}
+
+function onLayoutOrientationChange() {
+  const horizontal = isLayoutHorizontal();
+
+  if (!horizontal) {
+    clearLayoutWideDelayTimer();
+    layoutHorizontalActive = false;
+    layoutWideReady = false;
+    applyLayoutWideDomState();
+    return;
+  }
+
+  layoutHorizontalActive = true;
+  applyLayoutWideDomState();
+
+  if (layoutWideReady || layoutWideDelayTimerId != null) return;
+
+  layoutWideDelayTimerId = window.setTimeout(() => {
+    layoutWideDelayTimerId = null;
+    if (!isLayoutHorizontal()) return;
+    layoutWideReady = true;
+    applyLayoutWideDomState();
+  }, LAYOUT_WIDE_DELAY_MS);
+}
+
+function initLayoutWideListener() {
+  onLayoutOrientationChange();
+  try {
+    window.matchMedia(LAYOUT_HORIZONTAL_MQL).addEventListener("change", onLayoutOrientationChange);
+  } catch {
+    /* ignore */
+  }
+  window.addEventListener("resize", onLayoutOrientationChange);
+}
+
+function moverScoreHtml(scoreRaw) {
+  const scoreStr =
+    typeof scoreRaw === "number" && Number.isFinite(scoreRaw) ? String(Math.round(scoreRaw)) : escapeHtml(String(scoreRaw ?? "—"));
+  return `<b class="mover-score">${scoreStr}</b>`;
+}
+
+function suggestedTradeWideSubLine(row) {
+  const parts = [];
+  const ch = formatPct(row.change_pct);
+  if (ch && ch !== "—") parts.push(`${ch} session`);
+  const dir = row.direction != null ? String(row.direction).trim() : "";
+  if (dir && dir.toUpperCase() !== "NEUTRAL") parts.push(dir);
+  const strat = row.strategy != null ? String(row.strategy).trim() : "";
+  if (strat && strat !== "No Active Setup") parts.push(strat.replace(/_/g, " "));
+  const scoreV = typeof row.score === "number" && Number.isFinite(row.score) ? Math.round(row.score) : null;
+  if (scoreV != null) parts.push(`score ${scoreV}/100`);
+  return parts.length ? parts.join(" · ") : "—";
+}
+
+function moverBioHtml(mRow) {
+  const changeLabel = formatPct(mRow.change_pct);
+  const scoreHtml = moverScoreHtml(mRow.score);
+  const compactBio = `${escapeHtml(changeLabel)} · score ${scoreHtml}`;
+  const wideParts = [escapeHtml(changeLabel)];
+  const dir = mRow.direction != null ? String(mRow.direction).trim() : "";
+  if (dir && dir.toUpperCase() !== "NEUTRAL") wideParts.push(escapeHtml(dir));
+  const px = typeof mRow.price === "number" && Number.isFinite(mRow.price) ? mRow.price.toFixed(2) : null;
+  if (px) wideParts.push(escapeHtml(`$${px}`));
+  wideParts.push(`score ${scoreHtml}`);
+  const wideBio = wideParts.join(" · ");
+  return `<span class="dash-bio dash-bio--compact">${compactBio}</span><span class="dash-bio dash-bio--wide">${wideBio}</span>`;
+}
+
+function navigateToStockTickerOrAdd(rawSym) {
+  const tkNorm = normalizeHomeTickerToken(rawSym);
+  if (!tkNorm) return;
+  const cur = readHomeWatchlistTickers();
+  if (!cur.includes(tkNorm)) {
+    writeHomeWatchlistTickers([tkNorm, ...cur]);
+    applyHomeWatchlistInputFromStorage();
+    renderHomeScanner();
+    renderHomeDashboardPanels();
+  }
+  navigateToStockTicker(tkNorm);
 }
 
 function stopStockBarsPolling() {
@@ -2219,6 +2445,11 @@ function buildStockTickerAnalysisHtml(detailJson) {
     parts.push(`<p class="stock-detail-warn">${escapeHtml(String(ctx.last_error))}</p>`);
   }
 
+  const playbookHtml =
+    globalThis.TbNarrative?.playbookSectionHtml?.(detailJson, backendHealth.scan) ?? "";
+  const hasPlaybook = Boolean(playbookHtml);
+  if (playbookHtml) parts.push(playbookHtml);
+
   const strat =
     snapState.strategy != null && String(snapState.strategy).trim() !== ""
       ? String(snapState.strategy)
@@ -2334,7 +2565,7 @@ function buildStockTickerAnalysisHtml(detailJson) {
   const bd = sd.breakdown && typeof sd.breakdown === "object" ? sd.breakdown : null;
   const scannerReadPlain =
     typeof sd.explanation === "string" ? sd.explanation.trim() : "";
-  if (scannerReadPlain) {
+  if (scannerReadPlain && !hasPlaybook) {
     parts.push(`<div class="stock-detail-section">
       <p class="stock-detail-section-title">Scanner read</p>
       <p class="scanner-detail-line">${escapeHtml(scannerReadPlain)}</p>
@@ -2355,7 +2586,7 @@ function buildStockTickerAnalysisHtml(detailJson) {
       }
     }
   }
-  if (scoreRows.length) {
+  if (scoreRows.length && !hasPlaybook) {
     parts.push(`<div class="stock-detail-section">
       <p class="stock-detail-section-title">Score breakdown</p>
       <dl class="stock-detail-dl">${scoreRows.join("")}</dl>
@@ -2370,32 +2601,34 @@ function buildStockTickerAnalysisHtml(detailJson) {
     </div>`);
   }
 
-  const extras = [];
-  if (snapState.ale_details != null && snapState.ale_details !== "") {
-    const aleRaw =
-      typeof snapState.ale_details === "object"
-        ? JSON.stringify(snapState.ale_details, null, 2)
-        : String(snapState.ale_details);
+  if (!hasPlaybook) {
+    const extras = [];
+    if (snapState.ale_details != null && snapState.ale_details !== "") {
+      const aleRaw =
+        typeof snapState.ale_details === "object"
+          ? JSON.stringify(snapState.ale_details, null, 2)
+          : String(snapState.ale_details);
+      extras.push(
+        `<details class="stock-detail-raw"><summary>Scan extras</summary><pre class="scanner-json-snippet">${escapeHtml(aleRaw.slice(0, 6000))}</pre></details>`,
+      );
+    }
+    if (snapState.flow_result != null && snapState.flow_result !== "") {
+      const flowRaw =
+        typeof snapState.flow_result === "object"
+          ? JSON.stringify(snapState.flow_result, null, 2)
+          : String(snapState.flow_result);
+      extras.push(
+        `<details class="stock-detail-raw"><summary>Order flow</summary><pre class="scanner-json-snippet">${escapeHtml(flowRaw.slice(0, 6000))}</pre></details>`,
+      );
+    }
+    const rawInd = JSON.stringify(snapState.indicators ?? {}, null, 2);
+    const rawScore = JSON.stringify(snapState.score_data ?? {}, null, 2);
     extras.push(
-      `<details class="stock-detail-raw"><summary>Scan extras</summary><pre class="scanner-json-snippet">${escapeHtml(aleRaw.slice(0, 6000))}</pre></details>`,
+      `<details class="stock-detail-raw"><summary>All indicator fields (JSON)</summary><pre class="scanner-json-snippet">${escapeHtml(rawInd.slice(0, 12000))}</pre></details>`,
+      `<details class="stock-detail-raw"><summary>Full score payload (JSON)</summary><pre class="scanner-json-snippet">${escapeHtml(rawScore.slice(0, 8000))}</pre></details>`,
     );
+    parts.push(extras.join(""));
   }
-  if (snapState.flow_result != null && snapState.flow_result !== "") {
-    const flowRaw =
-      typeof snapState.flow_result === "object"
-        ? JSON.stringify(snapState.flow_result, null, 2)
-        : String(snapState.flow_result);
-    extras.push(
-      `<details class="stock-detail-raw"><summary>Order flow</summary><pre class="scanner-json-snippet">${escapeHtml(flowRaw.slice(0, 6000))}</pre></details>`,
-    );
-  }
-  const rawInd = JSON.stringify(snapState.indicators ?? {}, null, 2);
-  const rawScore = JSON.stringify(snapState.score_data ?? {}, null, 2);
-  extras.push(
-    `<details class="stock-detail-raw"><summary>All indicator fields (JSON)</summary><pre class="scanner-json-snippet">${escapeHtml(rawInd.slice(0, 12000))}</pre></details>`,
-    `<details class="stock-detail-raw"><summary>Full score payload (JSON)</summary><pre class="scanner-json-snippet">${escapeHtml(rawScore.slice(0, 8000))}</pre></details>`,
-  );
-  parts.push(extras.join(""));
 
   return parts.join("");
 }
@@ -2417,6 +2650,8 @@ async function hydrateStockScannerFacts(tickerSym) {
     }
     const detailJson = await detailResponse.json();
     factRoot.innerHTML = buildStockTickerAnalysisHtml(detailJson);
+    globalThis.TbNarrative?.wireDisclosure?.(factRoot);
+    globalThis.TbSkillMode?.applySkillMode?.(factRoot);
   } catch (errFact) {
     factRoot.innerHTML = `<p class="scanner-detail-line">${escapeHtml(errFact.message || String(errFact))}</p>`;
   }
@@ -2427,6 +2662,7 @@ async function refreshStockDesk(tickerSymToken) {
   if (heading) heading.textContent = tickerSymToken;
   stopStockBarsPolling();
   await hydrateStockScannerFacts(tickerSymToken);
+  globalThis.TbSymbolResearchBridge?.mountStockCta?.(tickerSymToken);
   await reloadStockBarsPack(tickerSymToken);
   scheduleStockDeskPollingBars(tickerSymToken);
 }
@@ -2512,8 +2748,7 @@ function initSidebarNavDragSort() {
     sidebarNavSortable.destroy();
     sidebarNavSortable = null;
   }
-  const reduceMotionUi =
-    typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reduceMotionUi = motionDisabled();
   const coarsePointer =
     typeof window.matchMedia === "function" &&
     window.matchMedia("(hover: none) and (pointer: coarse)").matches;
@@ -2552,7 +2787,7 @@ function resetWatchlistStoredEmpty() {
 function confirmResetLocalTradingBotAccount() {
   if (
     !window.confirm(
-      "Clear this browser’s Second Bar data?\nWatchlist, backtest history & saved settings, sidebar order, theme → defaults.",
+      "Clear this browser’s Second Bar data?\nWatchlist, backtest history & saved settings, sidebar order, theme, animation speed, font size → defaults.",
     )
   ) {
     return;
@@ -2563,6 +2798,8 @@ function confirmResetLocalTradingBotAccount() {
     localStorage.removeItem(BT_SETTINGS_BY_TICKER_KEY);
     localStorage.removeItem(NAV_ORDER_STORAGE_KEY);
     localStorage.removeItem(THEME_STORAGE_KEY);
+    localStorage.removeItem(globalThis.TbMotion?.STORAGE_KEY ?? "tb_motion_speed");
+    localStorage.removeItem(globalThis.TbFontSize?.STORAGE_KEY ?? "tb_font_size");
   } catch {
     /* ignore */
   }
@@ -2575,6 +2812,8 @@ function confirmResetLocalTradingBotAccount() {
   btExpandedHistoryId = null;
   btRunPanelDetailOpen = true;
   applyTheme("light");
+  globalThis.TbMotion?.setSpeed?.(globalThis.TbMotion?.DEFAULT_SPEED ?? 100);
+  globalThis.TbFontSize?.setSize?.(globalThis.TbFontSize?.DEFAULT_SIZE ?? "medium");
   applyHomeWatchlistInputFromStorage();
   applySidebarNavDomOrder([...SIDEBAR_NAV_DEFAULT_ORDER]);
   try {
@@ -2587,7 +2826,7 @@ function confirmResetLocalTradingBotAccount() {
   renderBtHistoryList();
   syncBacktestRouteUi();
   setPage("live");
-  if (location.hash !== "#home") location.hash = "#home";
+  if (location.hash !== "#home") setAppHash("#home");
   void refreshFromBackend();
 }
 
@@ -2638,17 +2877,52 @@ function attachSuggestedTradesPanelInteractions() {
   root.dataset.suggestedTradesWired = "1";
   root.addEventListener("click", (clickEvent) => {
     const btn = clickEvent.target?.closest?.("button[data-suggested-add]");
-    if (!btn || !root.contains(btn)) return;
+    if (btn && root.contains(btn)) {
+      clickEvent.preventDefault();
+      const raw = btn.getAttribute("data-suggested-add");
+      const norm = raw ? normalizeHomeTickerToken(raw) : "";
+      if (!norm) return;
+      const cur = readHomeWatchlistTickers();
+      if (cur.includes(norm)) return;
+      writeHomeWatchlistTickers([norm, ...cur]);
+      applyHomeWatchlistInputFromStorage();
+      renderHomeScanner();
+      renderHomeDashboardPanels();
+      return;
+    }
+    const chip = clickEvent.target?.closest?.(".ticker-chip--clickable[data-ticker]");
+    if (!chip || !root.contains(chip)) return;
+    if (clickEvent.metaKey || clickEvent.ctrlKey) return;
     clickEvent.preventDefault();
-    const raw = btn.getAttribute("data-suggested-add");
-    const norm = raw ? normalizeHomeTickerToken(raw) : "";
-    if (!norm) return;
-    const cur = readHomeWatchlistTickers();
-    if (cur.includes(norm)) return;
-    writeHomeWatchlistTickers([norm, ...cur]);
-    applyHomeWatchlistInputFromStorage();
-    renderHomeScanner();
-    renderHomeDashboardPanels();
+    clickEvent.stopPropagation();
+    const token = chip.getAttribute("data-ticker");
+    if (token) navigateToStockTickerOrAdd(token);
+  });
+}
+
+function attachTickerChipInteractions() {
+  const livePage = q("#live");
+  if (!livePage || livePage.dataset.tickerChipsWired === "1") return;
+  livePage.dataset.tickerChipsWired = "1";
+
+  livePage.addEventListener("click", (clickEvent) => {
+    const chip = clickEvent.target?.closest?.(".ticker-chip--clickable[data-ticker]");
+    if (!chip || !livePage.contains(chip)) return;
+    if (clickEvent.target?.closest?.("button[data-suggested-add]")) return;
+    if (clickEvent.metaKey || clickEvent.ctrlKey) return;
+    clickEvent.stopPropagation();
+    const token = chip.getAttribute("data-ticker");
+    if (token) navigateToStockTickerOrAdd(token);
+  });
+
+  livePage.addEventListener("keydown", (keyEvent) => {
+    const chip = keyEvent.target?.closest?.(".ticker-chip--clickable[data-ticker]");
+    if (!(chip instanceof HTMLElement) || !livePage.contains(chip)) return;
+    if (keyEvent.key !== "Enter" && keyEvent.key !== " ") return;
+    keyEvent.preventDefault();
+    keyEvent.stopPropagation();
+    const token = chip.getAttribute("data-ticker");
+    if (token) navigateToStockTickerOrAdd(token);
   });
 }
 
@@ -2842,8 +3116,61 @@ function classifyMarketPhase(now = new Date()) {
   };
 }
 
-/** Dashboard + Health summary for the NY session strip */
-function marketSessionUi(now = new Date()) {
+async function fetchMarketSession() {
+  try {
+    const res = await fetch("/api/market/session");
+    if (!res.ok) throw new Error("bad status");
+    const data = await res.json();
+    marketSessionState.loaded = true;
+    marketSessionState.data = data;
+    marketSessionState.simplified = false;
+  } catch {
+    marketSessionState.loaded = false;
+    marketSessionState.data = null;
+    marketSessionState.simplified = true;
+  }
+}
+
+function marketSessionUiFromApi(data, now = new Date()) {
+  const openNow = Boolean(data && data.is_session);
+  const targetIso = openNow ? data.next_close_et : data.next_open_et;
+  const targetUtc = targetIso ? new Date(targetIso) : null;
+  const deltaMs = targetUtc ? Math.max(0, targetUtc.getTime() - now.getTime()) : 0;
+  const countdownPhrase = openNow
+    ? `Regular session closes in ${formatRemainCompact(deltaMs)}`
+    : `Next regular session opens in ${formatRemainCompact(deltaMs)}`;
+
+  let key = "closed";
+  let title = "MARKET CLOSED";
+  if (openNow) {
+    key = "open";
+    title = "MARKET LIVE";
+  } else if (data && data.session_open_et) {
+    const openTime = new Date(data.session_open_et);
+    if (now < openTime) {
+      key = "pre";
+      title = "PREMARKET";
+    }
+  }
+
+  const message = (data && data.label) || "Market status is unavailable.";
+  const localClock = formatLocalWallClock(now);
+  const localTz = localTimeZoneShort(now);
+
+  return {
+    key,
+    title,
+    message,
+    localClock,
+    localTz,
+    countdownPhrase,
+    pillShort: title,
+    healthSummary: `${title}. ${countdownPhrase}.`,
+  };
+}
+
+/** Simplified Mon–Fri clock when /api/market/session is unavailable. */
+function marketSessionUiFallback(now = new Date()) {
   const phase = classifyMarketPhase(now);
   const openNow = phase.key === "open";
   const targetUtc = openNow ? findUpcomingRthSessionCloseUtcMinute(now) : findNextRthSessionOpenUtcMinute(now);
@@ -2867,6 +3194,27 @@ function marketSessionUi(now = new Date()) {
   };
 }
 
+/** Dashboard + Health summary for the NY session strip */
+function marketSessionUi(now = new Date()) {
+  if (marketSessionState.loaded && marketSessionState.data) {
+    return marketSessionUiFromApi(marketSessionState.data, now);
+  }
+  return marketSessionUiFallback(now);
+}
+
+function renderMarketSessionHint() {
+  const hintEl = q("#marketSessionHint");
+  if (!hintEl) return;
+  if (marketSessionState.simplified) {
+    hintEl.textContent = "Using simplified hours.";
+    return;
+  }
+  if (marketSessionState.loaded && marketSessionState.data) {
+    hintEl.textContent =
+      "Regular hours reflect the market calendar, including holidays and early closes.";
+  }
+}
+
 function stablePick(seed, arr) {
   const n = String(seed)
     .split("")
@@ -2887,6 +3235,7 @@ function truncateScannerExplanationForFeed(text, maxLen = SCANNER_FEED_EXPLANATI
 
 function renderHomeScanner(slideInTickers = null) {
   const note = q("#homeScannerImplementationNote");
+  const sampleBanner = q("#homeSampleDataBanner");
   const rowsEl = q("#homeScannerRows");
   const feedEl = q("#homeScannerSignalFeed");
   const badge = q("#homeScannerBadge");
@@ -2903,6 +3252,10 @@ function renderHomeScanner(slideInTickers = null) {
   const watchlistOnlySignals = signals.filter((s) =>
     watchlistSetUnified.has(normalizeHomeTickerToken(s.ticker)),
   );
+  const syncHomeSkillUi = () => {
+    globalThis.TbSkillMode?.applyAll?.();
+    globalThis.TbSkillMode?.applyContextPanelCollapse?.();
+  };
   const sigMap = indexScanSignalsByTicker(signals);
   const useFullMock = !backendHealth.loaded;
   const lastScanAt = scanPayload && scanPayload.last_scan_at ? String(scanPayload.last_scan_at) : null;
@@ -2914,9 +3267,12 @@ function renderHomeScanner(slideInTickers = null) {
     runBtn.setAttribute("aria-busy", homeScanRunInFlight ? "true" : "false");
   }
 
+  if (sampleBanner) {
+    sampleBanner.hidden = !useFullMock;
+  }
+
   if (useFullMock) {
-    note.textContent =
-      "Can’t reach the scanner service—showing sample rows until the server is running.";
+    note.textContent = "Sample rows below are for layout only. Start the server for live scans.";
   } else if (lastErr) {
     note.textContent = `Connected, but the last scan reported an error${lastScanAt ? ` (${lastScanAt})` : ""}: ${lastErr}`;
   } else {
@@ -2953,7 +3309,7 @@ function renderHomeScanner(slideInTickers = null) {
           const stratCell = formatScannerStrategyHtml({ strategy: item.strategy });
           const ch = formatPct(item.change_pct);
           return `<tr data-ticker="${escapeHtml(sym)}" class="scanner-table-row scanner-table-row--ghost scanner-row-muted" data-watchlisted="false">
-        <th scope="row"><b>${escapeHtml(sym)}</b></th>
+        <th scope="row">${tickerChipHtml(sym)}</th>
         <td>${escapeHtml("Suggested")}</td>
         <td>—</td>
         <td>${stratCell}</td>
@@ -2961,11 +3317,15 @@ function renderHomeScanner(slideInTickers = null) {
       </tr>`;
         })
         .join("");
-      feedEl.innerHTML = `<p class="scanner-feed-empty">${escapeHtml("Your watchlist is empty. Use the ideas below or add your own symbols above.")}</p>`;
+      feedEl.innerHTML = `<p class="scanner-feed-empty">${escapeHtml(
+        "Your watchlist is empty—add symbols above or pick from the ideas below.",
+      )}</p>`;
+      syncHomeSkillUi();
       return;
     }
     rowsEl.innerHTML = `<tr class="scanner-table-row scanner-table-empty-row"><td colspan="5">Save one or more symbols in the watchlist field above to fill this table.</td></tr>`;
-    feedEl.innerHTML = `<p class="scanner-feed-empty">Save symbols on your watchlist to see alerts here.</p>`;
+    feedEl.innerHTML = `<p class="scanner-feed-empty">Add symbols to your watchlist to see alerts here.</p>`;
+    syncHomeSkillUi();
     return;
   }
 
@@ -2987,7 +3347,7 @@ function renderHomeScanner(slideInTickers = null) {
                 : "No setup · sample";
 
         return `<tr${scannerTableRowAttrs(sym, slideList, watchlistSetUnified)}>
-        <th scope="row"><b>${escapeHtml(sym)}</b></th>
+        <th scope="row">${tickerChipHtml(sym)}</th>
         <td>${ms.key === "open" ? `${escapeHtml(scanVerbMockOpen)} · ${escapeHtml(phase)}` : escapeHtml("Paused")}</td>
         <td>${escapeHtml(tf)}</td>
         <td><code>${escapeHtml(sid)}</code> · ${escapeHtml(label)}</td>
@@ -3012,9 +3372,11 @@ function renderHomeScanner(slideInTickers = null) {
               )
             : escapeHtml("Paused");
         const stratCell = formatScannerStrategyHtml(sig);
-        const sigCell = `${escapeHtml(dir)} · conf ${escapeHtml(scoreLabel)}`;
+        const sigCell =
+          globalThis.TbNarrative?.watchlistAlertSignalHtml?.(sig, scanPayload) ||
+          `${escapeHtml(dir)} · conf ${escapeHtml(scoreLabel)}`;
         return `<tr${scannerTableRowAttrs(sym, slideList, watchlistSetUnified)}>
-        <th scope="row"><b>${escapeHtml(sym)}</b></th>
+        <th scope="row">${tickerChipHtml(sym)}</th>
         <td>${scanCell}</td>
         <td>${escapeHtml("5m")}</td>
         <td>${stratCell}</td>
@@ -3025,7 +3387,7 @@ function renderHomeScanner(slideInTickers = null) {
       const idleScanCell = ms.key === "open" ? escapeHtml("Idle · listening") : escapeHtml("Paused");
       const idleSig = ms.key === "open" ? "No setup · idle" : "—";
       return `<tr${scannerTableRowAttrs(sym, slideList, watchlistSetUnified)}>
-        <th scope="row"><b>${escapeHtml(sym)}</b></th>
+        <th scope="row">${tickerChipHtml(sym)}</th>
         <td>${idleScanCell}</td>
         <td>—</td>
         <td>—</td>
@@ -3044,7 +3406,7 @@ function renderHomeScanner(slideInTickers = null) {
             .map((sym) => {
               const sid = stablePick(sym + minuteBucket, MOCK_DAY_STRATEGY_IDS);
               const dir = stablePick(`${sym}-dir`, ["LONG", "SHORT"]);
-              return `<article class="scanner-feed-card scanner-feed-card-clickable" data-ticker="${escapeHtml(sym)}" tabindex="0" role="button"><span class="scanner-feed-main"><strong>${escapeHtml(sym)}</strong> · ${escapeHtml(dir)} · <code>${escapeHtml(sid)}</code></span><span class="scanner-feed-note">${escapeHtml(
+              return `<article class="scanner-feed-card scanner-feed-card-clickable" data-ticker="${escapeHtml(sym)}" tabindex="0" role="button"><span class="scanner-feed-main">${tickerChipHtml(sym)} · ${escapeHtml(dir)} · <code>${escapeHtml(sid)}</code></span><span class="scanner-feed-note">${escapeHtml(
                 MOCK_DAY_STRATEGY_LABEL_BY_ID[sid],
               )}</span><span class="scanner-feed-meta">sample</span></article>`;
             });
@@ -3052,7 +3414,8 @@ function renderHomeScanner(slideInTickers = null) {
     feedEl.innerHTML =
       feedLines.length > 0
         ? `<p class="eyebrow scanner-feed-heading">Sample highlights</p>${feedLines.join("")}`
-        : `<p class="scanner-feed-empty">Nothing to highlight this minute—or the session is closed.</p>`;
+        : `<p class="scanner-feed-empty">Nothing to highlight right now—the session may be closed.</p>`;
+    syncHomeSkillUi();
     return;
   }
 
@@ -3069,21 +3432,18 @@ function renderHomeScanner(slideInTickers = null) {
         const scLabel = sc != null ? `${Math.round(sc)}/100` : "—";
         const rawSt = s.strategy != null ? String(s.strategy).trim() : "";
         const noteLine = rawSt ? escapeHtml(rawSt) : "—";
-        const explSrc =
-          s.score_data && typeof s.score_data === "object" && typeof s.score_data.explanation === "string"
-            ? s.score_data.explanation
-            : "";
-        const explShort = truncateScannerExplanationForFeed(explSrc);
-        const explBlock = explShort
-          ? `<span class="scanner-feed-explanation">${escapeHtml(explShort)}</span>`
-          : "";
-        return `<article class="scanner-feed-card scanner-feed-card-clickable" data-ticker="${escapeHtml(sym)}" tabindex="0" role="button"><span class="scanner-feed-main"><strong>${escapeHtml(sym)}</strong> · ${escapeHtml(dir)} · conf ${escapeHtml(scLabel)}</span><span class="scanner-feed-note">${noteLine}</span>${explBlock}<span class="scanner-feed-meta">${escapeHtml(snapMeta)}</span></article>`;
+        const narrativeBlock = globalThis.TbNarrative?.feedCardInnerHtml?.(s, scanPayload) ?? "";
+        const historyCta = globalThis.TbSymbolResearchBridge?.checkHistoryCtaHtml?.(sym, "check-history-cta--feed") ?? "";
+        return `<article class="scanner-feed-card scanner-feed-card-clickable" data-ticker="${escapeHtml(sym)}" tabindex="0" role="button"><span class="scanner-feed-main">${tickerChipHtml(sym)} · ${escapeHtml(dir)} · conf ${escapeHtml(scLabel)}</span><span class="scanner-feed-note">${noteLine}</span>${narrativeBlock}<span class="scanner-feed-actions">${historyCta}</span><span class="scanner-feed-meta">${escapeHtml(snapMeta)}</span></article>`;
       })
       .join("")}`;
+    globalThis.TbSymbolResearchBridge?.wireCheckHistoryButtons?.(feedEl);
+    syncHomeSkillUi();
     return;
   }
 
-  feedEl.innerHTML = `<p class="scanner-feed-empty">No alerts for your saved symbols in the last snapshot. Try Run scan or wait for the next automatic pass.</p>`;
+  feedEl.innerHTML = `<p class="scanner-feed-empty">No alerts for your symbols in the last snapshot—run a scan or wait for the next pass.</p>`;
+  syncHomeSkillUi();
 }
 
 async function runHomeScanNow() {
@@ -3103,10 +3463,10 @@ async function runHomeScanNow() {
       const detail = errBody.detail != null ? String(errBody.detail) : res.statusText;
       console.warn("Run scan failed:", detail);
     }
-    await refreshFromBackend();
+    await refreshFromBackend({ forceScanLatest: true });
   } catch (e) {
     console.warn(e);
-    await refreshFromBackend();
+    await refreshFromBackend({ forceScanLatest: true });
   } finally {
     homeScanRunInFlight = false;
     renderHomeScanner();
@@ -3228,26 +3588,34 @@ function initHomeWatchlistControls() {
   }
 }
 
-async function refreshFromBackend() {
+async function refreshFromBackend(options = {}) {
+  const forceScanLatest = options.forceScanLatest === true;
+  const skipScanLatestPoll = scannerSseStreaming && !forceScanLatest;
   if (backendRefreshInFlight) return backendRefreshInFlight;
   backendRefreshInFlight = (async () => {
     const journalStatsPrior = backendHealth.journalStats;
     const journalEquityPrior = backendHealth.journalEquityCurve;
     const journalOpenTradesPrior = backendHealth.journalOpenTrades;
     try {
+      const scanFetch = skipScanLatestPoll
+        ? Promise.resolve(null)
+        : fetch("/api/scan/latest");
       const [healthRes, scanRes, journalStatsRes, journalEquityRes, journalOpenRes] = await Promise.all([
         fetch("/api/health"),
-        fetch("/api/scan/latest"),
+        scanFetch,
         fetch("/api/journal/stats"),
         fetch("/api/journal/equity"),
         fetch("/api/journal/trades/open"),
       ]);
-      if (!healthRes.ok || !scanRes.ok) throw new Error("bad status");
+      await fetchMarketSession();
+      if (!healthRes.ok) throw new Error("bad status");
+      if (scanRes != null && !scanRes.ok) throw new Error("bad status");
       const health = await healthRes.json();
-      const scan = await scanRes.json();
       backendHealth.loaded = true;
       backendHealth.health = health;
-      backendHealth.scan = scan;
+      if (scanRes != null) {
+        backendHealth.scan = await scanRes.json();
+      }
       if (journalStatsRes.ok) {
         backendHealth.journalStats = await journalStatsRes.json();
       } else {
@@ -3301,6 +3669,7 @@ function renderMarket() {
     pill.className = `market-pill ${ms.key}`;
     pill.textContent = ms.pillShort;
   }
+  renderMarketSessionHint();
   renderHomeScanner();
 }
 
@@ -3309,6 +3678,9 @@ function msUntilNextUtcMinute() {
 }
 
 function startHomeMarketClock() {
+  void fetchMarketSession().then(() => {
+    renderMarket();
+  });
   const tick = () => {
     renderMarket();
   };
@@ -3429,7 +3801,7 @@ function formatPct(x) {
   return `${x >= 0 ? "+" : ""}${x.toFixed(2)}%`;
 }
 
-function renderBacktestResults(payload) {
+async function renderBacktestResults(payload) {
   const el = q("#backtestResults");
   if (!payload || !payload.result) {
     el.innerHTML = "";
@@ -3440,6 +3812,9 @@ function renderBacktestResults(payload) {
   const sym = escapeHtml(String(r.symbol || "—"));
   const startD = escapeHtml(String(r.start_date || "?"));
   const endD = escapeHtml(String(r.end_date || "?"));
+
+  const chartMod = await loadBacktestChartModule();
+  const sparkHtml = chartMod.equitySparklineHtml(trades, escapeHtml);
 
   const cards = [
     ["Symbol", sym],
@@ -3500,6 +3875,8 @@ function renderBacktestResults(payload) {
           )
           .join("")}
       </div>
+      <p class="eyebrow" style="margin-top:14px">Return curve</p>
+      ${sparkHtml}
     </article>
     <article class="health-card">
       <p class="eyebrow">Trades</p>
@@ -3631,7 +4008,7 @@ async function submitBacktest() {
   const modalRun = q("#btModalRun");
   if (modalRun) modalRun.disabled = true;
   statusEl.textContent = "";
-  renderBacktestResults(null);
+  void renderBacktestResults(null);
   setBacktestProgress(6, "Preparing request…");
   try {
     const mode = q("#btTradingMode").value;
@@ -3650,10 +4027,9 @@ async function submitBacktest() {
     setBacktestProgress(18, "Sending request to server…");
     let waitPct = 28;
     setBacktestProgress(waitPct, "Waiting for server (fetching data & running engine)…");
-    const reduceMotion =
-      typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reduceMotion = motionDisabled();
     const waitStep = reduceMotion ? 6 : 3;
-    const waitMs = reduceMotion ? 1100 : 550;
+    const waitMs = reduceMotion ? motionDurationMs(1100) || 1100 : motionDurationMs(550) || 550;
     btProgressWaitTimer = setInterval(() => {
       waitPct = Math.min(waitPct + waitStep, 82);
       setBacktestProgress(waitPct, "Waiting for server (fetching data & running engine)…");
@@ -3697,7 +4073,8 @@ async function submitBacktest() {
       snapshot: merged,
     });
     saveBtSettingsForTickerKey(ticker);
-    renderBacktestResults(merged);
+    await renderBacktestResults(merged);
+    void refreshWfoValidationPanel();
     navigateBacktestResultHash();
     syncBacktestRouteUi();
     setBacktestProgress(100, "Complete.");
@@ -3728,6 +4105,9 @@ function setPage(page, options = {}) {
     state.stockTicker = null;
   }
   state.page = page;
+  if (prevPage !== page) {
+    resetAppScrollPosition();
+  }
   if (prevPage === "live" && page !== "live") {
     clearHomeWatchlistTypewriter();
   }
@@ -3758,9 +4138,11 @@ function setPage(page, options = {}) {
     }
   });
   if (page === "backtest") {
+    applyBacktestSymbolPrefillFromBridge();
     syncBacktestRouteUi();
     updateQuantStrategyWfoFootnote();
     void refreshWfoValidationPanel();
+    globalThis.TbSymbolResearchBridge?.onBacktestPageOpened?.();
   }
   if (page === "health" && prevPage !== "health") {
     void refreshFromBackend().then(() => {
@@ -3787,6 +4169,10 @@ function setPage(page, options = {}) {
 
 async function init() {
   initThemeToggle();
+  globalThis.TbSkillMode?.init?.();
+  globalThis.TbMotion?.init?.();
+  globalThis.TbFontSize?.init?.();
+  initLayoutWideListener();
   initHomeWatchlistControls();
   await loadDayStrategies();
   await loadQuantStrategies();
@@ -3799,6 +4185,14 @@ async function init() {
   }
   initBacktestSettingsDialog();
   initHashRouting();
+  globalThis.TbSymbolResearchBridge?.init?.();
+  window.addEventListener("hashchange", () => {
+    const h = normalizeAppHash();
+    if (state.page === "backtest" && (h === "backtest" || h.startsWith("backtest"))) {
+      applyBacktestSymbolPrefillFromBridge();
+      globalThis.TbSymbolResearchBridge?.onBacktestPageOpened?.();
+    }
+  });
   wireBtSettingsPersistence();
   initBtRunPanelBiviewResizeObserver();
   initStockDeskControlsOnce();
@@ -3811,6 +4205,7 @@ async function init() {
   if (sideNoteStatusBtn && sideNoteStatusBtn.dataset.wiredSideNoteHealth !== "1") {
     sideNoteStatusBtn.dataset.wiredSideNoteHealth = "1";
     sideNoteStatusBtn.addEventListener("click", () => {
+      playSideNoteDotClickSpin(sideNoteStatusBtn);
       setPage("health");
     });
   }
@@ -3843,6 +4238,7 @@ async function init() {
   startHomeMarketClock();
   attachScannerInteractions();
   attachSuggestedTradesPanelInteractions();
+  attachTickerChipInteractions();
   attachScannerFeedInteractions();
   startScannerEventSource();
   await refreshFromBackend();
@@ -3861,7 +4257,7 @@ async function init() {
         btRunPanelDetailOpen = true;
         const h = normalizeAppHash();
         if (h !== "backtest") {
-          location.hash = "#backtest";
+          setAppHash("#backtest");
         }
         syncBacktestRouteUi();
         updateBtRunPanelLayout();
@@ -3877,7 +4273,7 @@ async function init() {
     refreshStatusBtn.addEventListener("click", async () => {
       playRefreshStatusIconSpin(refreshStatusBtn);
       renderMarket();
-      await refreshFromBackend();
+      await refreshFromBackend({ forceScanLatest: true });
       maybeRenderHealth();
     });
   }

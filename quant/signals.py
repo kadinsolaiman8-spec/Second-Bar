@@ -10,8 +10,9 @@ import pandas as pd
 
 from quant.config_resolver import get_config_for_ticker
 from quant.indicator_scores import WeightedScores, compute_weighted_scores
-from quant.indicators import get_latest_indicators
+from quant.indicators import get_latest_indicators, indicators_at
 from quant.regime import RegimeState, classify_regime
+from scanner_core.dynamic_stops import snapshot_pct_trailing_stop
 
 
 @dataclass
@@ -105,6 +106,7 @@ def _compute_stop_tp_levels(
     stop_pct_config = bt.get("stop_pct", 0)
     take_profit_pct_config = bt.get("take_profit_pct", 0)
     trailing_atr_mult = bt.get("trailing_stop_atr_multiplier", 0)
+    trailing_stop_pct = bt.get("trailing_stop_pct", 0)
 
     stop_price: float | None = None
     stop_pct_display: float | None = None
@@ -116,6 +118,14 @@ def _compute_stop_tp_levels(
         else:
             stop_price = price + atr * trailing_atr_mult
             stop_pct_display = (stop_price - price) / price * 100 if price > 0 else None
+    elif trailing_stop_pct > 0 and trailing_atr_mult <= 0 and price > 0:
+        direction = "BUY" if signal_type == "Buy" else "SELL"
+        stop_price = snapshot_pct_trailing_stop(price, direction, trailing_stop_pct)
+        if stop_price is not None:
+            if signal_type == "Buy":
+                stop_pct_display = -trailing_stop_pct
+            else:
+                stop_pct_display = trailing_stop_pct
     elif stop_pct_config > 0:
         if signal_type == "Buy":
             stop_price = price * (1 - stop_pct_config / 100)
@@ -132,6 +142,114 @@ def _compute_stop_tp_levels(
             take_profit_price = price * (1 - take_profit_pct_config / 100)
 
     return (stop_price, take_profit_price, stop_pct_display)
+
+
+def _signal_from_indicators(
+    ind: dict,
+    symbol: str,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    ignore_volatility: bool,
+    config: dict,
+    min_net_score: float,
+    news_sentiment: float | None,
+    expert_sentiment: float | None,
+    timeframe: str | None,
+    vix: float | None,
+) -> Signal | None:
+    """Build Signal from a precomputed indicator snapshot."""
+    regime_state = classify_regime(
+        close=ind["close"],
+        sma_200=ind.get("sma_200"),
+        vix=vix,
+        config=config,
+    )
+
+    weighted = compute_weighted_scores(
+        ind, config, ignore_volatility=ignore_volatility, news_sentiment=news_sentiment,
+        expert_sentiment=expert_sentiment, timeframe=timeframe, regime_state=regime_state,
+    )
+    min_net = config.get("min_net_score", min_net_score)
+
+    rsi = ind["rsi"]
+    macd_hist = ind["macd_hist"]
+    close = ind["close"]
+    atr_pct = ind.get("atr_pct", 0.0)
+
+    if weighted.net_score >= min_net:
+        signal_type = "Buy"
+        confidence = _compute_confidence(
+            weighted, signal_type, rsi, macd_hist,
+            rsi_oversold, rsi_overbought,
+            timeframe=timeframe, config=config,
+        )
+    elif weighted.net_score <= -min_net:
+        signal_type = "Sell"
+        confidence = _compute_confidence(
+            weighted, signal_type, rsi, macd_hist,
+            rsi_oversold, rsi_overbought,
+            timeframe=timeframe, config=config,
+        )
+    else:
+        signal_type = "Hold"
+        confidence = 0
+
+    stop_price, take_profit_price, stop_pct = _compute_stop_tp_levels(
+        signal_type=signal_type,
+        price=close,
+        atr=ind.get("atr"),
+        atr_pct=atr_pct,
+        config=config,
+    )
+
+    return Signal(
+        symbol=symbol,
+        signal_type=signal_type,
+        confidence=confidence,
+        rsi=rsi,
+        macd_hist=macd_hist,
+        price=close,
+        atr_pct=atr_pct,
+        net_score=weighted.net_score,
+        weighted_scores=weighted,
+        regime=regime_state.display_label,
+        stop_price=stop_price,
+        take_profit_price=take_profit_price,
+        stop_pct=stop_pct,
+    )
+
+
+def evaluate_signal_at(
+    i: int,
+    precomp: dict,
+    symbol: str,
+    rsi_oversold: float = 35,
+    rsi_overbought: float = 65,
+    ignore_volatility: bool = False,
+    config: dict | None = None,
+    min_net_score: float = 0.5,
+    news_sentiment: float | None = None,
+    expert_sentiment: float | None = None,
+    timeframe: str | None = None,
+    vix: float | None = None,
+) -> Signal | None:
+    """Evaluate MR signal at bar index i using precomputed indicators."""
+    ind = indicators_at(i, precomp)
+    if ind is None:
+        return None
+    return _signal_from_indicators(
+        ind,
+        symbol,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+        ignore_volatility=ignore_volatility,
+        config=config or {},
+        min_net_score=min_net_score,
+        news_sentiment=news_sentiment,
+        expert_sentiment=expert_sentiment,
+        timeframe=timeframe,
+        vix=vix,
+    )
 
 
 def evaluate_signal(
@@ -195,65 +313,18 @@ def evaluate_signal(
 
     config = config or {}
 
-    # Build regime state from VIX + SMA-200
-    regime_state = classify_regime(
-        close=ind["close"],
-        sma_200=ind.get("sma_200"),
+    return _signal_from_indicators(
+        ind,
+        symbol,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+        ignore_volatility=ignore_volatility,
+        config=config,
+        min_net_score=min_net_score,
+        news_sentiment=news_sentiment,
+        expert_sentiment=expert_sentiment,
+        timeframe=timeframe,
         vix=vix,
-        config=config,
-    )
-
-    weighted = compute_weighted_scores(
-        ind, config, ignore_volatility=ignore_volatility, news_sentiment=news_sentiment,
-        expert_sentiment=expert_sentiment, timeframe=timeframe, regime_state=regime_state,
-    )
-    min_net = config.get("min_net_score", min_net_score)
-
-    rsi = ind["rsi"]
-    macd_hist = ind["macd_hist"]
-    close = ind["close"]
-    atr_pct = ind.get("atr_pct", 0.0)
-
-    if weighted.net_score >= min_net:
-        signal_type = "Buy"
-        confidence = _compute_confidence(
-            weighted, signal_type, rsi, macd_hist,
-            rsi_oversold, rsi_overbought,
-            timeframe=timeframe, config=config,
-        )
-    elif weighted.net_score <= -min_net:
-        signal_type = "Sell"
-        confidence = _compute_confidence(
-            weighted, signal_type, rsi, macd_hist,
-            rsi_oversold, rsi_overbought,
-            timeframe=timeframe, config=config,
-        )
-    else:
-        signal_type = "Hold"
-        confidence = 0
-
-    stop_price, take_profit_price, stop_pct = _compute_stop_tp_levels(
-        signal_type=signal_type,
-        price=close,
-        atr=ind.get("atr"),
-        atr_pct=atr_pct,
-        config=config,
-    )
-
-    return Signal(
-        symbol=symbol,
-        signal_type=signal_type,
-        confidence=confidence,
-        rsi=rsi,
-        macd_hist=macd_hist,
-        price=close,
-        atr_pct=atr_pct,
-        net_score=weighted.net_score,
-        weighted_scores=weighted,
-        regime=regime_state.display_label,
-        stop_price=stop_price,
-        take_profit_price=take_profit_price,
-        stop_pct=stop_pct,
     )
 
 

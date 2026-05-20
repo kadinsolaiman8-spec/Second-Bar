@@ -322,21 +322,52 @@ def classify_market_state(spy_5m: pd.DataFrame = None,
 # UPDATE ENGINE
 # ══════════════════════════════════════════════════════════════════════════
 
-async def update_market_state(alert_channel=None, bot=None) -> str:
+async def update_market_state(
+    alert_channel=None,
+    bot=None,
+    spy_cache: dict | None = None,
+    vix: float | None = None,
+) -> str:
     """
     Fetch SPY data and reclassify market state.
     Sends a transition message to alert_channel if state changed.
     Returns the new state string.
+
+    When ``spy_cache`` contains 5m/15m frames (e.g. from ``refresh_spy_cache``),
+    SPY downloads are skipped. Pass ``vix`` to avoid a duplicate VIX fetch.
     """
     global _current_state, _state_entered_at, _state_data, _last_update
 
     try:
         loop = asyncio.get_event_loop()
-        spy_5m, spy_15m, vix = await asyncio.gather(
-            loop.run_in_executor(_executor, _fetch_spy_data),
-            loop.run_in_executor(_executor, _fetch_spy_15m),
-            loop.run_in_executor(_executor, _fetch_vix),
-        )
+        spy_5m = None
+        spy_15m = None
+        if spy_cache:
+            spy_5m = spy_cache.get("5m")
+            spy_15m = spy_cache.get("15m")
+
+        fetch_tasks = []
+        if spy_5m is None or getattr(spy_5m, "empty", True):
+            fetch_tasks.append(("spy_5m", loop.run_in_executor(_executor, _fetch_spy_data)))
+        if spy_15m is None or getattr(spy_15m, "empty", True):
+            fetch_tasks.append(("spy_15m", loop.run_in_executor(_executor, _fetch_spy_15m)))
+        if vix is None:
+            fetch_tasks.append(("vix", loop.run_in_executor(_executor, _fetch_vix)))
+
+        if fetch_tasks:
+            names = [name for name, _ in fetch_tasks]
+            coros = [coro for _, coro in fetch_tasks]
+            results = await asyncio.gather(*coros)
+            resolved = dict(zip(names, results, strict=True))
+            if "spy_5m" in resolved:
+                spy_5m = resolved["spy_5m"]
+            if "spy_15m" in resolved:
+                spy_15m = resolved["spy_15m"]
+            if "vix" in resolved:
+                vix = resolved["vix"]
+
+        if vix is None:
+            vix = 0.0
 
         data = classify_market_state(spy_5m, spy_15m, vix)
         new_state = data["state"]

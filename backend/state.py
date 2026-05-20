@@ -12,15 +12,31 @@ _latest_signals: list[dict[str, Any]] = []
 _last_scan_at: str | None = None
 _last_scan_error: str | None = None
 
+_SIGNAL_KEYS_OMIT_FROM_BROADCAST = frozenset({"indicators"})
 
-def json_safe(obj: Any) -> Any:
+
+def slim_signal_for_broadcast(signal: dict[str, Any]) -> dict[str, Any]:
+    """Drop bulky fields from signals stored for SSE, snapshots, and SQLite."""
+    if not isinstance(signal, dict):
+        return signal
+    return {k: v for k, v in signal.items() if k not in _SIGNAL_KEYS_OMIT_FROM_BROADCAST}
+
+
+def json_safe(obj: Any, *, _seen: set[int] | None = None) -> Any:
     """Convert numpy/pandas-ish values for JSON serialization."""
+    if _seen is None:
+        _seen = set()
+    obj_id = id(obj)
+    if obj_id in _seen and isinstance(obj, (dict, list, tuple)):
+        return obj
     if obj is None:
         return None
     if isinstance(obj, dict):
-        return {str(k): json_safe(v) for k, v in obj.items()}
+        _seen.add(obj_id)
+        return {str(k): json_safe(v, _seen=_seen) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [json_safe(v) for v in obj]
+        _seen.add(obj_id)
+        return [json_safe(v, _seen=_seen) for v in obj]
     if isinstance(obj, bool):
         return obj
     if isinstance(obj, float):
@@ -46,7 +62,9 @@ def set_scan_result(
     error: str | None = None,
 ) -> None:
     global _latest_signals, _last_scan_at, _last_scan_error
-    _latest_signals = [json_safe(s) for s in signals]
+    _latest_signals = [
+        json_safe(slim_signal_for_broadcast(s)) for s in signals if isinstance(s, dict)
+    ]
     _last_scan_at = ts_iso if ts_iso else None
     _last_scan_error = error
 

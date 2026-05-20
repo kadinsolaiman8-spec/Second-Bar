@@ -11,7 +11,7 @@ from typing import Literal
 import pandas as pd
 
 from quant.data import fetch_single, yfinance_effective_period
-from quant.indicators import compute_atr
+from quant.indicators import compute_atr, precompute_indicators
 from quant.intraday_backtest_strategies import (
     ALLOWED_DAY_STRATEGY_IDS,
     day_trade_signal_at,
@@ -20,9 +20,9 @@ from quant.intraday_backtest_strategies import (
 from quant.stop import StopRequested, clear_stop, is_stop_requested
 
 logger = logging.getLogger(__name__)
-from quant.hybrid import evaluate_hybrid
-from quant.signals import evaluate_signal
-from quant.signals_trend import evaluate_breakout_signal
+from quant.hybrid import hybrid_signal_at
+from quant.signals import evaluate_signal_at
+from quant.signals_trend import breakout_signal_at, precompute_breakout
 
 # Module-level cache for DXY/TIP series (avoid repeated fetches during WFO).
 # Keyed by (symbol, period, interval).  Protected by lock for thread safety.
@@ -224,6 +224,39 @@ def run_backtest(
     # Cap warmup for short windows (e.g. weekly 52-bar train); need at least 1 tradable bar
     min_warmup = min(min_warmup, len(df) - 2)
 
+    precomp_mr: dict | None = None
+    precomp_tf: dict | None = None
+    if trading_mode != "day_trading":
+        if strategy in ("mr", "hybrid"):
+            precomp_mr = precompute_indicators(
+                df,
+                rsi_period=ind.get("rsi_period", 14),
+                macd_fast=ind.get("macd_fast", 12),
+                macd_slow=ind.get("macd_slow", 26),
+                macd_signal=ind.get("macd_signal", 9),
+                bb_period=ind.get("bb_period", 20),
+                bb_std=ind.get("bb_std", 2),
+                supertrend_period=ind.get("supertrend_period", 10),
+                supertrend_multiplier=ind.get("supertrend_multiplier", 3),
+                stoch_window=ind.get("stoch_window", 14),
+                stoch_smooth=ind.get("stoch_smooth", 3),
+                willr_period=ind.get("willr_period", 14),
+                ema_fast=ind.get("ema_fast", 9),
+                ema_slow=ind.get("ema_slow", 21),
+                atr_period=ind.get("atr_period", 14),
+                atr_avg_period=ind.get("atr_avg_period", 20),
+            )
+        if strategy in ("tf", "hybrid"):
+            tf_cfg = config.get("trend_following", {})
+            precomp_tf = precompute_breakout(
+                df,
+                donchian_period=tf_cfg.get("donchian_period", 20),
+                atr_period=tf_cfg.get("atr_period", 14),
+                adx_period=tf_cfg.get("adx_period", 14),
+                adx_threshold=tf_cfg.get("adx_threshold", 25),
+                config=config,
+            )
+
     position: float | None = None  # entry price when long
     entry_date: str | None = None
     entry_bar_index: int | None = None
@@ -325,9 +358,6 @@ def run_backtest(
                 peak_price = None
                 continue
 
-        bar_df = df.iloc[: i + 1].copy()
-
-        # Look up VIX at this bar's date for regime classification
         bar_vix = None
         if vix_series is not None:
             bar_date = df.index[i]
@@ -342,51 +372,36 @@ def run_backtest(
             assert precomp_day is not None
             signal = day_trade_signal_at(i, precomp_day, symbol, df)
         elif strategy == "hybrid":
-            signal = evaluate_hybrid(
-                bar_df,
+            assert precomp_mr is not None and precomp_tf is not None
+            signal = hybrid_signal_at(
+                i,
+                precomp_mr,
+                precomp_tf,
                 symbol,
+                df,
                 config=config,
                 ignore_volatility=ignore_volatility,
                 timeframe=timeframe,
                 vix=bar_vix,
             )
         elif strategy == "tf":
-            tf_cfg = config.get("trend_following", {})
-            signal = evaluate_breakout_signal(
-                bar_df,
+            assert precomp_tf is not None
+            signal = breakout_signal_at(
+                i,
+                precomp_tf,
                 symbol,
-                donchian_period=tf_cfg.get("donchian_period", 20),
-                atr_period=tf_cfg.get("atr_period", 14),
-                adx_period=tf_cfg.get("adx_period", 14),
-                adx_threshold=tf_cfg.get("adx_threshold", 25),
+                df,
                 config=config,
                 macro_filter=_gold_filter,
             )
         else:
-            signal = evaluate_signal(
-                bar_df,
+            assert precomp_mr is not None
+            signal = evaluate_signal_at(
+                i,
+                precomp_mr,
                 symbol,
                 rsi_oversold=ind.get("rsi_oversold", 35),
                 rsi_overbought=ind.get("rsi_overbought", 65),
-                rsi_period=ind.get("rsi_period", 14),
-                macd_fast=ind.get("macd_fast", 12),
-                macd_slow=ind.get("macd_slow", 26),
-                macd_signal=ind.get("macd_signal", 9),
-                bb_period=ind.get("bb_period", 20),
-                bb_std=ind.get("bb_std", 2),
-                supertrend_period=ind.get("supertrend_period", 10),
-                supertrend_multiplier=ind.get("supertrend_multiplier", 3),
-                stoch_window=ind.get("stoch_window", 14),
-                stoch_smooth=ind.get("stoch_smooth", 3),
-                stoch_oversold=ind.get("stoch_oversold", 20),
-                stoch_overbought=ind.get("stoch_overbought", 80),
-                willr_period=ind.get("willr_period", 14),
-                willr_oversold=ind.get("willr_oversold", -80),
-                willr_overbought=ind.get("willr_overbought", -20),
-                ema_fast=ind.get("ema_fast", 9),
-                ema_slow=ind.get("ema_slow", 21),
-                atr_period=ind.get("atr_period", 14),
-                atr_avg_period=ind.get("atr_avg_period", 20),
                 ignore_volatility=ignore_volatility,
                 config=config,
                 news_sentiment=None,

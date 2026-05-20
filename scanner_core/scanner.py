@@ -58,7 +58,10 @@ from scanner_core.market_state import (
 )
 from scanner_core.mean_reversion import detect_mean_reversion, is_mean_reversion_strategy
 from scanner_core.institutional_flow import analyze_institutional_flow
-from scanner_core.dynamic_stops import calculate_dynamic_stop
+from scanner_core.dynamic_stops import (
+    apply_backtest_trailing_stop_overlay,
+    calculate_dynamic_stop,
+)
 from scanner_core.cooldown import (
     is_in_cooldown, is_muted, is_vwap_trapped, set_vwap_trap,
     check_reversal_reset, get_due_reminders,
@@ -82,6 +85,10 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("peewee").setLevel(logging.CRITICAL)
 
 _executor = ThreadPoolExecutor(max_workers=12)
+
+_OHLCV_PERIOD_MAP = {"1m": "1d", "5m": "5d", "15m": "5d", "1h": "30d"}
+_SCAN_BATCH_SIZE = 25
+_scan_ohlcv_cache: dict[str, dict[str, Optional[pd.DataFrame]]] | None = None
 
 # ══════════════════════════════════════════════════════════════════════════
 # GLOBAL STATE
@@ -516,34 +523,164 @@ def _is_orb_window() -> bool:
 # DATA FETCHING
 # ══════════════════════════════════════════════════════════════════════════
 
+def _record_ticker_fetch_failure(ticker: str) -> None:
+    """Track consecutive failures; skip tickers after threshold."""
+    _fetch_fail_count[ticker] = _fetch_fail_count.get(ticker, 0) + 1
+    if _fetch_fail_count[ticker] >= DELISTED_FAIL_THRESHOLD:
+        _delisted_cache.add(ticker)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DELISTED] %s skipped after %s consecutive failures",
+                ticker,
+                DELISTED_FAIL_THRESHOLD,
+            )
+
+
+def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def _extract_batch_ticker_frame(
+    batch_df: pd.DataFrame,
+    ticker: str,
+    batch: list[str],
+) -> Optional[pd.DataFrame]:
+    """Pull one symbol's OHLCV frame from a yfinance batch download."""
+    if batch_df is None or batch_df.empty:
+        return None
+    try:
+        if isinstance(batch_df.columns, pd.MultiIndex):
+            level0 = batch_df.columns.get_level_values(0)
+            if ticker not in level0:
+                return None
+            sub = batch_df[ticker].copy()
+        elif len(batch) == 1 and batch[0] == ticker:
+            sub = batch_df.copy()
+        else:
+            return None
+        sub = _normalize_ohlcv_columns(sub)
+        need_cols = ["Open", "High", "Low", "Close", "Volume"]
+        if not all(col in sub.columns for col in need_cols):
+            return None
+        return sub.dropna(subset=["Open", "High", "Low", "Close"], how="any")
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _batch_download_timeframe(
+    tickers: list[str],
+    timeframe: str,
+) -> dict[str, Optional[pd.DataFrame]]:
+    """Batch yfinance download for one interval (runs in executor thread)."""
+    period = _OHLCV_PERIOD_MAP.get(timeframe, "5d")
+    out: dict[str, Optional[pd.DataFrame]] = {t: None for t in tickers}
+    active = [t for t in tickers if t not in _delisted_cache]
+    if not active:
+        return out
+
+    for i in range(0, len(active), _SCAN_BATCH_SIZE):
+        batch = active[i : i + _SCAN_BATCH_SIZE]
+        try:
+            batch_df = yf.download(
+                batch,
+                period=period,
+                interval=timeframe,
+                group_by="ticker",
+                progress=False,
+                threads=False,
+                auto_adjust=True,
+            )
+        except Exception as e:
+            logger.debug("Batch download failed %s %s: %s", batch[:3], timeframe, e)
+            for ticker in batch:
+                _record_ticker_fetch_failure(ticker)
+            continue
+
+        for ticker in batch:
+            sub = _extract_batch_ticker_frame(batch_df, ticker, batch)
+            if sub is None or sub.empty:
+                _record_ticker_fetch_failure(ticker)
+            else:
+                _fetch_fail_count.pop(ticker, None)
+                out[ticker] = sub
+
+    return out
+
+
+def _build_scan_ohlcv_cache_sync(
+    tickers: list[str],
+    timeframes: list[str],
+) -> dict[str, dict[str, Optional[pd.DataFrame]]]:
+    """Populate per-ticker timeframe frames for one scan cycle."""
+    cache: dict[str, dict[str, Optional[pd.DataFrame]]] = {
+        t: {} for t in tickers
+    }
+    unique = list(dict.fromkeys(tickers))
+    for timeframe in timeframes:
+        by_ticker = _batch_download_timeframe(unique, timeframe)
+        for ticker, frame in by_ticker.items():
+            cache.setdefault(ticker, {})[timeframe] = frame
+    return cache
+
+
+async def prime_scan_ohlcv_cache(
+    tickers: list[str],
+    timeframes: list[str] | None = None,
+) -> None:
+    """Batch-download OHLCV for all tickers before parallel scan_ticker runs."""
+    global _scan_ohlcv_cache
+    tfs = timeframes if timeframes is not None else list(TIMEFRAMES)
+    loop = asyncio.get_event_loop()
+    _scan_ohlcv_cache = await loop.run_in_executor(
+        _executor,
+        _build_scan_ohlcv_cache_sync,
+        list(tickers),
+        list(tfs),
+    )
+    logger.debug(
+        "Scan OHLCV cache primed: %s tickers × %s timeframes",
+        len(tickers),
+        len(tfs),
+    )
+
+
+def clear_scan_ohlcv_cache() -> None:
+    """Drop scan-cycle cache after scan_all_tickers completes."""
+    global _scan_ohlcv_cache
+    _scan_ohlcv_cache = None
+
+
 def _fetch_ohlcv(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
     """
     Synchronous yfinance download — runs in a thread so the event loop
     never blocks.  Tracks consecutive failures to auto-skip delisted tickers.
+    Uses the scan-cycle batch cache when primed.
     """
     if ticker in _delisted_cache:
         return None
+
+    if _scan_ohlcv_cache is not None:
+        tf_map = _scan_ohlcv_cache.get(ticker)
+        if tf_map is not None and timeframe in tf_map:
+            cached = tf_map.get(timeframe)
+            if cached is not None and not cached.empty:
+                return cached
+            return None
+
     try:
-        period_map = {"1m": "1d", "5m": "5d", "15m": "5d", "1h": "30d"}
-        period = period_map.get(timeframe, "5d")
+        period = _OHLCV_PERIOD_MAP.get(timeframe, "5d")
         df = yf.download(ticker, period=period, interval=timeframe,
                          progress=False, auto_adjust=True)
         if df is None or df.empty:
-            _fetch_fail_count[ticker] = _fetch_fail_count.get(ticker, 0) + 1
-            if _fetch_fail_count[ticker] >= DELISTED_FAIL_THRESHOLD:
-                _delisted_cache.add(ticker)
-                print(f"  [DELISTED] {ticker} skipped after {DELISTED_FAIL_THRESHOLD} consecutive failures")
+            _record_ticker_fetch_failure(ticker)
             return None
-        # Success — reset failure counter
         _fetch_fail_count.pop(ticker, None)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+        return _normalize_ohlcv_columns(df)
     except Exception as e:
-        _fetch_fail_count[ticker] = _fetch_fail_count.get(ticker, 0) + 1
-        if _fetch_fail_count[ticker] >= DELISTED_FAIL_THRESHOLD:
-            _delisted_cache.add(ticker)
-            print(f"  [DELISTED] {ticker} skipped after {DELISTED_FAIL_THRESHOLD} consecutive failures")
+        _record_ticker_fetch_failure(ticker)
         logger.debug(f"Fetch error {ticker} {timeframe}: {e}")
         return None
 
@@ -595,9 +732,12 @@ def fetch_ticker_data(ticker: str, period: str = "5d",
         return None
 
 
-async def fetch_all_timeframes(ticker: str) -> dict:
-    """Fetch 1m, 5m, 15m, 1h DataFrames in parallel."""
-    timeframes_ordered = list(TIMEFRAMES)
+async def fetch_all_timeframes(
+    ticker: str,
+    timeframes: list[str] | None = None,
+) -> dict:
+    """Fetch OHLCV DataFrames (default: all TIMEFRAMES) via cache or parallel fetches."""
+    timeframes_ordered = list(timeframes) if timeframes is not None else list(TIMEFRAMES)
     frames = await asyncio.gather(
         *[fetch_ohlcv_async(ticker, timeframe_name) for timeframe_name in timeframes_ordered],
         return_exceptions=True,
@@ -613,12 +753,15 @@ async def fetch_all_timeframes(ticker: str) -> dict:
 
 
 async def refresh_spy_cache():
-    """Refresh SPY data across all timeframes."""
+    """Refresh SPY data across all timeframes (parallel single-symbol fetches)."""
     global spy_cache
-    for tf in TIMEFRAMES:
-        df = await fetch_ohlcv_async(SPY_TICKER, tf)
-        if df is not None and not df.empty:
-            spy_cache[tf] = df
+    frames = await asyncio.gather(
+        *[fetch_ohlcv_async(SPY_TICKER, tf) for tf in TIMEFRAMES],
+        return_exceptions=True,
+    )
+    for tf, frame in zip(TIMEFRAMES, frames, strict=True):
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            spy_cache[tf] = frame
     logger.debug(f"SPY cache refreshed: {list(spy_cache.keys())}")
 
 
@@ -665,14 +808,31 @@ def _compute_orb_levels(df_5m: pd.DataFrame) -> dict:
 
 
 async def compute_orb_for_all(tickers: list):
-    """Compute ORB levels for a list of tickers."""
+    """Compute ORB levels for a list of tickers (uses scan cache when available)."""
     global orb_data, _orb_computed
     if _orb_computed:
         return
+
+    missing: list[str] = []
     for ticker in tickers:
-        df_5m = await fetch_ohlcv_async(ticker, "5m")
-        if df_5m is not None:
+        df_5m = None
+        if _scan_ohlcv_cache is not None:
+            tf_map = _scan_ohlcv_cache.get(ticker, {})
+            df_5m = tf_map.get("5m")
+        if df_5m is not None and not df_5m.empty:
             orb_data[ticker] = _compute_orb_levels(df_5m)
+        else:
+            missing.append(ticker)
+
+    if missing:
+        frames = await asyncio.gather(
+            *[fetch_ohlcv_async(t, "5m") for t in missing],
+            return_exceptions=True,
+        )
+        for ticker, frame in zip(missing, frames, strict=True):
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                orb_data[ticker] = _compute_orb_levels(frame)
+
     _orb_computed = True
     logger.info(f"ORB computed for {len(orb_data)} tickers")
 
@@ -1056,8 +1216,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         if not is_market_open():
             logger.debug(f"{ticker}: market closed; trade scans are disabled.")
             try:
-                data = await fetch_all_timeframes(ticker)
-                df_5m = data.get("5m")
+                df_5m = await fetch_ohlcv_async(ticker, "5m")
                 if df_5m is not None and not df_5m.empty and len(df_5m) >= 2:
                     price = float(df_5m["Close"].iloc[-1])
                     prev_close = float(df_5m["Close"].iloc[-2])
@@ -1211,7 +1370,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         ms_state = get_current_market_state()
 
         if ms_state == "HIGH_VOLATILITY":
-            print(f"  [GATE] {ticker}: Blocked — HIGH_VOLATILITY state (0% trend WR)")
+            logger.debug("%s: blocked — HIGH_VOLATILITY state", ticker)
             _store_state(ticker, entry_price, indicators,
                          {"total": 0}, direction, "None",
                          bullish_count, bearish_count, change_pct)
@@ -1225,7 +1384,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
                 strat_result = mr_result
                 strategy_name = strat_result.get("strategy", "Mean Reversion")
             else:
-                print(f"  [GATE] {ticker}: Blocked — RANGING state, no MR signal")
+                logger.debug("%s: blocked — RANGING state, no MR signal", ticker)
                 _store_state(ticker, entry_price, indicators,
                              {"total": 0}, direction, "None",
                              bullish_count, bearish_count, change_pct)
@@ -1248,7 +1407,11 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             # WEAK_TREND: only allow EMA Pullback
             if ms_state == "WEAK_TREND":
                 if not is_strategy_allowed_for_state(strategy_name, ms_state):
-                    print(f"  [GATE] {ticker}: Blocked — WEAK_TREND only allows EMA Pullback, got {strategy_name}")
+                    logger.debug(
+                        "%s: blocked — WEAK_TREND only allows EMA Pullback, got %s",
+                        ticker,
+                        strategy_name,
+                    )
                     _store_state(ticker, entry_price, indicators,
                                  {"total": 0}, direction, strategy_name,
                                  bullish_count, bearish_count, change_pct)
@@ -1273,6 +1436,10 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             tp2 = strat_result.get("tp2", 0)
             tp3 = 0
             stop_type = "Strategy"
+
+        stop, stop_type = apply_backtest_trailing_stop_overlay(
+            entry_price, direction, stop, stop_type
+        )
 
         risk = abs(entry_price - stop) if stop != 0 else 1
         rr = round(abs(tp1 - entry_price) / risk, 2) if risk > 0 else 0
@@ -1306,7 +1473,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         # ── Step 6d: Sector VWAP confirmation ───────────────────────────
         sector_penalty, sector_suppress = _get_sector_vwap_penalty(ticker)
         if sector_suppress:
-            print(f"  [GATE] {ticker}: Sector ETF too far below VWAP — suppressed")
+            logger.debug("%s: sector ETF too far below VWAP — suppressed", ticker)
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
                          bearish_count, change_pct, stop=stop, tp1=tp1)
@@ -1365,7 +1532,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
         # GATE 5: RSI not overextended (>72 = overbought, skip)
         rsi_val = indicators.get("rsi", {}).get("value", 50) or 50
         if isinstance(rsi_val, (int, float)) and rsi_val > 72:
-            print(f"  [GATE] {ticker}: Failed Gate 5 — RSI {rsi_val:.0f} (overextended)")
+            logger.debug("%s: gate 5 — RSI %.0f overextended", ticker, rsi_val)
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
                          bearish_count, change_pct, stop=stop, tp1=tp1)
@@ -1373,7 +1540,7 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
 
         # GATE 7: Minimum R:R ratio 1.8:1
         if 0 < rr < 1.8:
-            print(f"  [GATE] {ticker}: Failed Gate 7 — R:R {rr:.2f} < 1.8 minimum")
+            logger.debug("%s: gate 7 — R:R %.2f below minimum", ticker, rr)
             _store_state(ticker, entry_price, indicators, score_data,
                          direction, strategy_name, bullish_count,
                          bearish_count, change_pct, stop=stop, tp1=tp1)
@@ -1450,7 +1617,6 @@ async def scan_ticker(ticker: str) -> Optional[dict]:
             "rr": rr,
             "strategy": strategy_name,
             "score_data": score_data,
-            "indicators": indicators,
             "bullish_count": bullish_count,
             "bearish_count": bearish_count,
             "regime": regime.get("label", "TRENDING"),
@@ -1499,61 +1665,71 @@ async def scan_all_tickers(
         reset_orb_data()
         _orb_date_et = today_et
 
-    if _is_orb_window() and not _orb_computed:
-        await compute_orb_for_all(tickers[:20])
+    market_open = is_market_open()
+    scan_timeframes = list(TIMEFRAMES) if market_open else ["5m"]
 
-    # Update sector VWAP cache for sector confirmation
-    await _update_sector_vwap_cache()
+    await refresh_spy_cache()
+    await prime_scan_ohlcv_cache(tickers, scan_timeframes)
 
-    # Update regime quality score and market state before scanning
-    spy_5m = spy_cache.get("5m")
-    if spy_5m is not None and not spy_5m.empty:
-        spy_ind = _run_indicators_safe(spy_5m)
-        try:
-            from scanner_core.utils import fetch_vix
-            vix_data = fetch_vix()
-            vix_val = vix_data.get("value", 0)
-        except Exception:
-            vix_val = 0
-        update_regime_quality(spy_ind, vix_val)
-        # Update regime label from SPY data before per-ticker loop consumes it
-        update_regime(spy_5m)
-        # Update market state (non-blocking, uses cached data)
-        try:
-            from scanner_core.market_state import update_market_state
-            await update_market_state(alert_channel, None)
-        except Exception:
-            pass
+    try:
+        if _is_orb_window() and not _orb_computed:
+            await compute_orb_for_all(tickers[:20])
 
-    # Parallel scan: launch all tickers as async tasks in larger batches
-    batch_size = max(BATCH_SIZE, 20)
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        tasks = [scan_ticker(t) for t in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Update sector VWAP cache for sector confirmation
+        await _update_sector_vwap_cache()
 
-        for result in results:
-            if isinstance(result, Exception):
-                logger.debug(f"Batch scan exception: {result}")
-                continue
-            if result is not None:
-                signals.append(result)
-
-        scanned_count = min(i + len(batch), len(tickers))
-        if on_scan_progress is not None:
+        # Update regime quality score and market state before scanning
+        spy_5m = spy_cache.get("5m")
+        vix_val = 0.0
+        if spy_5m is not None and not spy_5m.empty:
+            spy_ind = _run_indicators_safe(spy_5m)
             try:
-                await on_scan_progress({
-                    "scanned_count": scanned_count,
-                    "total_count": len(tickers),
-                    "current_batch": list(batch),
-                    "elapsed_seconds": round(time.time() - scan_start, 2),
-                    "signals_so_far": len(signals),
-                })
+                from scanner_core.utils import fetch_vix
+                vix_data = fetch_vix()
+                vix_val = vix_data.get("value", 0)
             except Exception:
-                logger.debug("on_scan_progress callback failed", exc_info=True)
+                vix_val = 0.0
+            update_regime_quality(spy_ind, vix_val)
+            update_regime(spy_5m)
+            try:
+                from scanner_core.market_state import update_market_state
+                await update_market_state(
+                    alert_channel, None, spy_cache=spy_cache, vix=vix_val,
+                )
+            except Exception:
+                pass
 
-        if i + batch_size < len(tickers):
-            await asyncio.sleep(BATCH_SLEEP_SECONDS)
+        # Parallel scan: launch all tickers as async tasks in larger batches
+        batch_size = max(BATCH_SIZE, 20)
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i + batch_size]
+            tasks = [scan_ticker(t) for t in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.debug(f"Batch scan exception: {result}")
+                    continue
+                if result is not None:
+                    signals.append(result)
+
+            scanned_count = min(i + len(batch), len(tickers))
+            if on_scan_progress is not None:
+                try:
+                    await on_scan_progress({
+                        "scanned_count": scanned_count,
+                        "total_count": len(tickers),
+                        "current_batch": list(batch),
+                        "elapsed_seconds": round(time.time() - scan_start, 2),
+                        "signals_so_far": len(signals),
+                    })
+                except Exception:
+                    logger.debug("on_scan_progress callback failed", exc_info=True)
+
+            if i + batch_size < len(tickers):
+                await asyncio.sleep(BATCH_SLEEP_SECONDS)
+    finally:
+        clear_scan_ohlcv_cache()
 
     signals.sort(key=lambda s: s.get("score_data", {}).get("total", 0), reverse=True)
 
@@ -1630,7 +1806,7 @@ def get_ticker_state(ticker: str) -> dict:
     return ticker_state.get(ticker.upper(), {})
 
 
-def get_all_watchlist_stocks() -> list:
+def get_all_watchlist_stocks(*, rescore_zeros: bool = True) -> list:
     """Return all cached stocks sorted by score.
     If a stock has score=0 but has indicator data, re-score it live."""
     items = []
@@ -1639,7 +1815,7 @@ def get_all_watchlist_stocks() -> list:
         strategy = state.get("strategy", "")
 
         # Re-score stocks that have 0 but have cached indicators
-        if score <= 0 and state.get("indicators"):
+        if rescore_zeros and score <= 0 and state.get("indicators"):
             try:
                 from scanner_core.scoring import get_score
                 price = state.get("price", 0)
@@ -1692,11 +1868,16 @@ def _identify_weakness(indicators: dict, score_data: dict) -> str:
     return "; ".join(weaknesses) if weaknesses else "No major weakness"
 
 
-def get_best_stocks(min_score: int = 0, limit: int = 5) -> list:
+def get_best_stocks(
+    min_score: int = 0,
+    limit: int = 5,
+    *,
+    rescore_zeros: bool = True,
+) -> list:
     """Return top-scoring stocks from cache.
     When ``min_score`` > 0, prefer rows meeting that threshold; if none qualify,
     fall back to top-by-score so callers always get up to ``limit`` rows."""
-    all_stocks = get_all_watchlist_stocks()
+    all_stocks = get_all_watchlist_stocks(rescore_zeros=rescore_zeros)
     candidates = []
     for s in all_stocks:
         score = s.get("score", 0)

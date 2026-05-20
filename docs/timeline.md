@@ -17,11 +17,28 @@ Both lanes stay in **one** repo and **one** runtime; they are two sides of the a
 
 ## Baseline (today)
 
-- **Shipping stack**: FastAPI + static dashboard + `scanner_core` scans (manual + scheduled) + `quant` backtest/WFO and related docs.
-- **Scanner data**: Rule checks, scores, indicators, and levels are already produced for detailed views; surfacing a consistent **plain-language story** and **skill-tier UX** is incomplete.
-- **Edge & validation**: Whether setups are *economically* reliable is a research outcome, not a shipped toggle—see [`STRATEGY_AND_EDGE.md`](STRATEGY_AND_EDGE.md), [`WFO_COMMANDS.md`](WFO_COMMANDS.md), [`wfo_batches/`](wfo_batches/).
+- **Shipping stack**: FastAPI + static dashboard + `scanner_core` scans (manual + scheduled) + `quant` backtest/WFO and related docs. GitHub Actions runs `python -m pytest tests/ -v` on push/PR.
+- **Scanner assistant (Phase A + B shipped)**: Server-built `assistant` payloads on scan rows and ticker detail (`backend/assistant_narrative.py`). Home feed, suggested trades, and stock detail render **Headline → Why → Checklist → Levels** via `site/modules/narrative.js`. Experience level toggle (`beginner` | `standard` | `advanced`) persists in localStorage (`site/modules/skill-mode.js`). Beginner coaching tips load from `site/data/coaching.json` (`site/modules/coaching.js`).
+- **Phase 2 v2 — frontend integration (shipped)**: Closes remaining assistant UX gaps without backend changes. **Client assistant lookup** unifies home feed and watchlist playbooks (prefer row `assistant`, else match top picks / suggested list by symbol, else a single client-built playbook from fields already on the row). **Context panels** on Home surface opening-range breakouts, squeeze names, and sector leaders from the latest scan bundle. **Quant bridge**: “Check history” prefills Backtest from scanner symbols; in-app tutorial panel from the existing tutorial API; backtest results add a trade sparkline and a scan cross-line when the symbol matches the latest snapshot. **Deferred:** per-row `assistant` on every `signals[]` entry from the server—only if client lookup is not enough in practice.
+- **Session clock & ops trust (Phase A + D slice)**: `GET /api/market/session` drives the Home clock (NYSE calendar; simplified Mon–Fri fallback with “Using simplified hours” when the API is unavailable). When the backend is down, Home shows a **Sample data—start the server** banner instead of silent mock rows. Tests cover scan publish/SSE, SQLite persistence restart, market session API, and trailing-stop level exposure.
+- **Edge & validation (Phase C UX bridge)**: Whether setups are *economically* reliable remains a research outcome—not a shipped toggle—see [`STRATEGY_AND_EDGE.md`](STRATEGY_AND_EDGE.md), [`WFO_COMMANDS.md`](WFO_COMMANDS.md), [`wfo_batches/`](wfo_batches/). The Backtest tab includes walk-forward **“What this means for you”** copy via `site/modules/research-bridge.js` (dynamic import from `site/app.js`) and a bundled **example** export at `data/wfo-results/example-summary.json` so the view is not empty on first open.
+
+### Freshness & session (trader-facing)
+
+Use this wording in product surfaces—not internal module names.
+
+- **Market clock:** Home shows whether the **regular session** is open, closed, or not yet open today, plus a countdown to the next open or close. If calendar data is unavailable, the clock falls back to simplified weekday hours and says so.
+- **Latest snapshot:** Scanner rows reflect the **most recent completed scan**, with a timestamp when the service is connected. Treat alerts as a snapshot of that run—not a live quote feed—until a new scan finishes.
+- **When new trade alerts pause:** The scanner does not emit new **trade-style alerts** outside regular session hours. While the service is connected, automatic scans may still run on a schedule; you can also run a manual scan from Home. If the scanner service is not running, you will see **sample data**—start the app locally before relying on rows.
+- **Temporary alert pause:** After a streak of losing outcomes, the scanner may **pause new alerts for a short window** (circuit breaker). System health shows whether that pause is active and when it is expected to lift.
+- **Staying current:** Keep the dashboard open while you work; scanner and chart areas update from the connected service without refreshing the whole page.
+
+### Non-goals (this phase)
+
+- **Proving economic edge:** Backtest and walk-forward outputs inform how you think about robustness and risk; they do **not** certify that live alerts will be profitable. See validation docs under `docs/` for methodology—not a product guarantee.
 
 ---
+
 
 ## Phase A — Scanner clarity & operational trust
 
